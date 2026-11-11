@@ -1,0 +1,689 @@
+#!/bin/busybox ash
+# xxri-install-backend - installation engine for the xxri OS Lite installer.
+#
+# xxri-installer is only the front-end; every disk operation is here. The
+# system copy itself is install2disk, unchanged.
+#
+# Subcommands
+#   list-disks              DISK|/dev/sda|Model|SizeMiB|removable|fs-summary
+#   list-parts              PART|/dev/sda1|SizeMiB|fstype|label
+#   run <config-file>       perform the installation
+#
+# run streams a machine protocol on stdout (one record per line):
+#   P|<percent>|<current operation>     progress update
+#   L|<text>                            log detail
+#   E|<message>                         fatal error (backend has cleaned up)
+#   DONE|<root-uuid>                    success
+#
+# Config file (sh syntax):
+#   MODE=auto|manual        auto: whole DISK is repartitioned; manual: PART
+#   DISK=/dev/sdX           (auto)
+#   PART=/dev/sdX1          (manual)
+#   USERNAME= PASSWORD= HOSTNAME= AUTOLOGIN=1|0
+#   TZSTR=WIB-7  LANGUAGE=en_US  KEYMAP=qwerty/us  XKB=us
+
+fail() { echo "E|$1"; cleanup; exit 1; }
+say()  { echo "P|$1|$2"; }
+log()  { echo "L|$1"; }
+
+MNT=""
+cleanup() {
+	[ -n "$MNT" ] && grep -q " $MNT " /proc/mounts && umount "$MNT" 2>/dev/null
+	[ -n "$MNT" ] && rmdir "$MNT" 2>/dev/null
+}
+
+# disks
+disk_model() {
+	m="$(cat /sys/block/$1/device/model 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//')"
+	v="$(cat /sys/block/$1/device/vendor 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//')"
+	case "$m" in "$v"*) v="";; esac
+	echo "${v:+$v }${m:-Disk}"
+}
+
+disk_mib() { # awk, not $(( )): ash arithmetic is 32-bit and a 1 TiB disk has 2^31 sectors
+	awk '{ printf "%d\n", $1 / 2048 }' /sys/block/$1/size 2>/dev/null || echo 0
+}
+
+fs_summary() { # whole-disk fs summary from its partitions
+	out=""
+	for p in /sys/block/$1/$1*; do
+		[ -d "$p" ] || continue
+		t="$(blkid -o export /dev/${p##*/} 2>/dev/null | awk -F= '/^TYPE/{print $2}')"
+		[ -n "$t" ] && out="${out:+$out,}$t"
+	done
+	[ -n "$out" ] || out="empty"
+	echo "$out"
+}
+
+# Disks the running system was started from (extensions, packages, kernel),
+# through loop (iso=) and device-mapper (Ventoy) devices. A live boot's / is
+# RAM, so the check against / never caught the USB stick.
+blk_disks() { # $1 block device node; recursive, hence local
+	local b f s
+	b="$(readlink -f "$1")"; b=${b##*/}
+	[ -e "/sys/class/block/$b" ] || return 0
+	case "$b" in
+		loop*) f="$(cat "/sys/block/$b/loop/backing_file" 2>/dev/null)"
+		       [ -n "$f" ] && path_disks "$f"
+		       return 0 ;;
+	esac
+	if ls "/sys/class/block/$b/slaves/"* >/dev/null 2>&1; then
+		for s in "/sys/class/block/$b/slaves/"*; do blk_disks "/dev/${s##*/}"; done
+		return 0
+	fi
+	[ -e "/sys/class/block/$b/partition" ] &&
+		b="$(basename "$(dirname "$(readlink -f "/sys/class/block/$b")")")"
+	echo "$b"
+}
+path_disks() { # $1 path -> the disk(s) of the filesystem it is on
+	local dev
+	dev="$(awk -v p="$1/" '{ m = ($2 == "/") ? "/" : $2 "/" }
+		index(p, m) == 1 && length(m) > best { best = length(m); d = $1 }
+		END { print d }' /proc/mounts)"
+	case "$dev" in /dev/*) blk_disks "$dev" ;; esac
+}
+medium_disks() {
+	for p in "$(cat /etc/sysconfig/cde 2>/dev/null)" \
+	         "$(readlink /etc/sysconfig/tcedir 2>/dev/null)" "$(find_kernel_src)"; do
+		[ -n "$p" ] && path_disks "$p"
+	done | sort -u
+}
+
+list_disks() {
+	MEDIUM=" $(medium_disks | tr '\n' ' ') "
+	for b in /sys/block/*; do
+		d=${b##*/}
+		case "$d" in loop*|ram*|sr*|fd*|zram*|dm-*) continue;; esac
+		case "$MEDIUM" in *" $d "*) continue;; esac
+		[ "$(cat $b/size 2>/dev/null || echo 0)" -gt 0 ] || continue
+		rm=$(cat $b/removable 2>/dev/null || echo 0)
+		echo "DISK|/dev/$d|$(disk_model $d)|$(disk_mib $d)|$rm|$(fs_summary $d)"
+	done
+}
+
+list_parts() {
+	for b in /sys/block/*; do
+		d=${b##*/}
+		case "$d" in loop*|ram*|sr*|fd*|zram*|dm-*) continue;; esac
+		for p in $b/$d*; do
+			[ -d "$p" ] || continue
+			pn=${p##*/}
+			s=$(cat $p/size 2>/dev/null || echo 0)
+			eval "$(blkid -o export /dev/$pn 2>/dev/null | grep -E '^(TYPE|LABEL)=' )"
+			echo "PART|/dev/$pn|$(( s / 2048 ))|${TYPE:-none}|${LABEL:-}"
+			TYPE=""; LABEL=""
+		done
+	done
+}
+
+# partition
+part_of_disk() { # first partition node name for a disk
+	case "$1" in
+		*nvme*|*mmcblk*) echo "${1}p1" ;;
+		*) echo "${1}1" ;;
+	esac
+}
+
+part_dev() { # $1 /dev/disk, $2 number -> /dev/disk partition node
+	case "$1" in
+		*nvme*|*mmcblk*|*loop*) echo "${1}p$2" ;;
+		*) echo "$1$2" ;;
+	esac
+}
+
+wait_node() { # $1 block device node that partitioning just created
+	i=0
+	while [ ! -b "$1" ] && [ $i -lt 40 ]; do
+		mdev -s 2>/dev/null
+		sleep 0.25
+		i=$((i+1))
+	done
+	[ -b "$1" ] || fail "partition $1 did not appear after partitioning"
+}
+
+# the installed system boots the way this one did:
+#   bios   legacy BIOS or UEFI-CSM   -> GRUB i386-pc in the MBR / BIOS boot partition
+#   efi32  32-bit (IA32) UEFI        -> GRUB i386-efi on an EFI system partition
+#                                       (i686 XXRI only)
+#   efi64  64-bit UEFI               -> GRUB x86_64-efi on an EFI system partition
+#                                       (x86_64 XXRI only; the i686 kernel cannot
+#                                       start from it, see docs)
+firmware() {
+	if [ -d /sys/firmware/efi ]; then
+		[ "$(cat /sys/firmware/efi/fw_platform_size 2>/dev/null)" = 64 ] && echo efi64 || echo efi32
+	else
+		echo bios
+	fi
+}
+
+is_gpt() { # $1 disk: the primary GPT header sits in LBA 1
+	[ "$(dd if="$1" bs=512 skip=1 count=1 2>/dev/null | head -c 8)" = "EFI PART" ]
+}
+
+auto_partition() { # $1 = /dev/sdX -> AUTOPART (root), AUTOESP, AUTONUM
+	say 6 "Creating partition table on $1"
+	SECTORS=$(cat /sys/block/${1##*/}/size 2>/dev/null || echo 0)
+	MIB=$(disk_mib ${1##*/})
+	# wipe both ends: a stale backup GPT makes an MBR disk look like GPT
+	dd if=/dev/zero of="$1" bs=1M count=1 conv=notrunc 2>/dev/null
+	[ "$MIB" -gt 2 ] && dd if=/dev/zero of="$1" bs=1M seek=$((MIB - 1)) count=1 conv=notrunc 2>/dev/null
+	AUTOESP=""
+	if [ "$FW" = bios ] && [ "$SECTORS" -le 4294967295 ]; then
+		# MBR, one active partition at 1 MiB; the gap holds GRUB's core image
+		# (busybox fdisk's default sector 63 leaves only 31 KiB)
+		printf 'o\nn\np\n1\n2048\n\na\n1\nw\n' | fdisk "$1" >/dev/null 2>&1
+		AUTONUM=1
+	else
+		# GPT: BIOS boot (so it also boots on legacy firmware), ESP, root
+		sgdisk -Z "$1" >/dev/null 2>&1
+		sgdisk -n 1:2048:+1M -t 1:EF02 -c 1:"BIOS boot" \
+		       -n 2:0:+260M  -t 2:EF00 -c 2:"EFI system" \
+		       -n 3:0:0      -t 3:8300 -c 3:"XXRI OS Lite" "$1" >/tmp/xxri-sgdisk.log 2>&1 \
+			|| fail "could not create the GPT partition table on $1"
+		AUTONUM=3
+		AUTOESP="$(part_dev "$1" 2)"
+	fi
+	sync
+	AUTOPART="$(part_dev "$1" $AUTONUM)"
+	wait_node "$AUTOPART"
+	if [ -n "$AUTOESP" ]; then
+		wait_node "$AUTOESP"
+		# 260 MiB, 1 sector/cluster: under 65525 clusters UEFI sees FAT16 and
+		# can't mount it; 260 MiB still clears that on 4Kn disks
+		mkdosfs -F 32 -s 1 -n XXRIEFI "$AUTOESP" >/dev/null 2>&1 || fail "could not format the EFI system partition $AUTOESP"
+	fi
+}
+
+set_bootflag() { # $1 disk, $2 partnum - idempotent ('a' is a toggle)
+	PDEV="$(part_of_disk ${1##*/})"; PDEV="/dev/${PDEV%1}$2"
+	fdisk -l "$1" 2>/dev/null | awk -v p="$PDEV" '$1==p && $2=="*"{f=1} END{exit !f}' \
+		&& return 0
+	printf 'a\n%s\nw\n' "$2" | fdisk "$1" >/dev/null 2>&1 || true
+	sync
+}
+
+# install
+format_target() { # $1 partition
+	# conservative ext4 so older loaders and e2fsprogs can read it too
+	# (2.5's EXTLINUX needed it; GRUB 2.14 doesn't care)
+	mkfs.ext4 -F -q -L XXRIROOT \
+		-O ^metadata_csum,^metadata_csum_seed,^64bit,^orphan_file \
+		"$1" 2>/tmp/xxri-mkfs.err || fail "mkfs.ext4 failed on $1"
+	sync
+}
+
+copy_system() { # $1 partition; delegates to install2disk with df progress
+	SRC_KB=$(df -k / | awk 'NR==2{print $3}')
+	[ "$SRC_KB" -gt 0 ] || SRC_KB=1
+	say 14 "Copying system files"
+	/usr/sbin/install2disk "$1" --yes > /tmp/xxri-i2d.log 2>&1 &
+	I2D=$!
+	while kill -0 $I2D 2>/dev/null; do
+		M=$(awk '$2 ~ /^\/mnt\/install2disk/ {print $2; exit}' /proc/mounts)
+		if [ -n "$M" ]; then
+			USED=$(df -k "$M" 2>/dev/null | awk 'NR==2{print $3}')
+			[ -n "$USED" ] && [ "$USED" -gt 0 ] && {
+				pct=$(( 14 + USED * 62 / SRC_KB ))
+				[ $pct -gt 76 ] && pct=76
+				say $pct "Copying system files"
+			}
+		fi
+		sleep 1
+	done
+	wait $I2D
+	RC=$?
+	if [ $RC -ne 0 ]; then
+		log "$(tail -3 /tmp/xxri-i2d.log | tr '\n' ' ')"
+		fail "system copy failed (install2disk exit $RC)"
+	fi
+	say 78 "System files copied"
+}
+
+mount_target() {
+	MNT="/mnt/xxri-target.$$"
+	mkdir -p "$MNT"
+	mount -o rw "$1" "$MNT" || fail "cannot mount $1 for configuration"
+}
+
+configure_user() {
+	say 80 "Creating your account"
+	OLDUSER="xxri"
+	[ -s "$MNT/etc/sysconfig/tcuser" ] && read OLDUSER < "$MNT/etc/sysconfig/tcuser"
+	NEWUSER="${USERNAME:-xxri}"
+	if [ "$NEWUSER" != "$OLDUSER" ]; then
+		sed -i "s|^$OLDUSER:|$NEWUSER:|; s|/home/$OLDUSER|/home/$NEWUSER|" "$MNT/etc/passwd"
+		sed -i "s|^$OLDUSER:|$NEWUSER:|" "$MNT/etc/shadow"
+		sed -i "s|\b$OLDUSER\b|$NEWUSER|g" "$MNT/etc/group"
+		[ -d "$MNT/home/$OLDUSER" ] && mv "$MNT/home/$OLDUSER" "$MNT/home/$NEWUSER"
+		echo "$NEWUSER" > "$MNT/etc/sysconfig/tcuser"
+		# sudo rights follow the account (replaces the live-user rule)
+		sed -i "s|^$OLDUSER\b|$NEWUSER|" "$MNT/etc/sudoers" 2>/dev/null
+	fi
+	mkdir -p "$MNT/home/$NEWUSER"
+	if [ -n "$PASSWORD" ]; then
+		echo "$NEWUSER:$PASSWORD" | chroot "$MNT" /usr/sbin/chpasswd -m 2>/dev/null \
+			|| fail "could not set the account password"
+	fi
+	if [ "${AUTOLOGIN:-1}" = "1" ]; then
+		rm -f "$MNT/etc/sysconfig/noautologin" "$MNT/etc/sysconfig/noautologin.persist"
+	else
+		# root/.profile skips autologin when this file is non-empty; it
+		# truncates it each time, so bootsync re-arms it from the flag.
+		echo manual > "$MNT/etc/sysconfig/noautologin"
+		touch "$MNT/etc/sysconfig/noautologin.persist"
+		grep -q noautologin.persist "$MNT/opt/bootsync.sh" 2>/dev/null || cat >> "$MNT/opt/bootsync.sh" <<'EOF'
+
+# xxri-installer: permanent "ask for login" choice.
+[ -f /etc/sysconfig/noautologin.persist ] && echo manual > /etc/sysconfig/noautologin
+EOF
+	fi
+}
+
+configure_system() {
+	say 84 "Applying hostname and locale"
+	H="${HOSTNAME:-xxri}"
+	echo "$H" > "$MNT/etc/hostname"
+	if grep -q '^127.0.0.1' "$MNT/etc/hosts" 2>/dev/null; then
+		sed -i "s|^127.0.0.1.*|127.0.0.1    $H localhost|" "$MNT/etc/hosts"
+	else
+		echo "127.0.0.1    $H localhost" >> "$MNT/etc/hosts"
+	fi
+	# cde points at the live CD; the installed system uses /tce
+	rm -f "$MNT/etc/sysconfig/cde"
+	echo "/tce" > "$MNT/etc/sysconfig/tcedir"
+
+	# CA bundle: ca-certificates.tcz's install script never runs here, and
+	# without it wget, the Store and Qt (blank browser site icons) all fail.
+	# OpenSSL looks for cert.pem and certs/, Qt only under /etc/ssl.
+	say 85 "Installing the TLS trust store"
+	CADIR="$MNT/usr/local/share/ca-certificates"
+	if [ -d "$CADIR" ]; then
+		mkdir -p "$MNT/usr/local/etc/ssl/certs" "$MNT/etc/ssl/certs"
+		find "$CADIR" -name '*.crt' -exec cat {} + \
+			> "$MNT/usr/local/etc/ssl/certs/ca-certificates.crt" 2>/dev/null
+		cp -f "$MNT/usr/local/etc/ssl/certs/ca-certificates.crt" \
+		      "$MNT/etc/ssl/certs/ca-certificates.crt" 2>/dev/null
+		ln -sf /usr/local/etc/ssl/certs/ca-certificates.crt \
+		       "$MNT/usr/local/etc/ssl/cert.pem"
+		ln -sf /usr/local/etc/ssl/certs/ca-certificates.crt \
+		       "$MNT/usr/local/etc/ssl/cacert.pem"
+		ln -sf /usr/local/etc/ssl/certs/ca-certificates.crt \
+		       "$MNT/usr/local/etc/ssl/ca-bundle.crt"
+		ln -sf /etc/ssl/certs/ca-certificates.crt "$MNT/etc/ssl/cert.pem"
+		log "CA bundle: $(grep -c 'BEGIN CERTIFICATE' \
+			"$MNT/usr/local/etc/ssl/certs/ca-certificates.crt" 2>/dev/null) certificates"
+	else
+		log "no ca-certificates source on the target - HTTPS clients will not verify"
+	fi
+	[ -n "$TZSTR" ]    && echo "TZ=$TZSTR" > "$MNT/etc/sysconfig/timezone"
+	[ -n "$LANGUAGE" ] && echo "LANG=$LANGUAGE" > "$MNT/etc/sysconfig/language"
+	[ -n "$KEYMAP" ]   && echo "KEYMAP=$KEYMAP" > "$MNT/etc/sysconfig/keymap"
+	# X layout, applied at boot by xxri-config; plain us needs no file
+	case "$XKB" in ''|us) ;; *) echo "XKB=$XKB" > "$MNT/etc/sysconfig/xkb" ;; esac
+}
+
+# ---------------------------------------------------------------- baking --
+#
+# The installed system has to be complete at "All done". install2disk also
+# copies /tce (190 .tcz + onboot.lst), and loading those on every boot made
+# installs ~3x slower than a pre-baked image (164 loop mounts). So fill in
+# what the copy missed, then empty /tce/optional and onboot.lst.
+#
+# cp -n is load-bearing: the target already has the XXRI files on top of the
+# extension content (dot.wbar, skel, patched flwm); overwriting would undo them.
+bake_extensions() {
+	say 86 "Baking extensions into the installed system"
+	CDESRC=""
+	if [ -s /etc/sysconfig/cde ]; then
+		CDESRC="$(cat /etc/sysconfig/cde)"; CDESRC="${CDESRC%/}"
+	fi
+	[ -d "$CDESRC" ] || CDESRC="$(dirname "$(find_kernel_src)")/cde/optional"
+	LST="$(dirname "$CDESRC")/onboot.lst"
+	if [ ! -d "$CDESRC" ] || [ ! -s "$LST" ]; then
+		log "no extension medium found - target keeps whatever install2disk copied"
+	else
+		# Non-copy2fs extensions are symlinked into /tmp/tcloop, and
+		# install2disk copies the links (the Browser vanished from the dock
+		# that way). Copy from the live mounts; mounting the .tcz again runs
+		# out of loop devices. Progress stays within 86..88 whatever the
+		# count, or the bar goes backwards.
+		n=0; total=0
+		for d in /tmp/tcloop/*; do [ -d "$d" ] && total=$((total+1)); done
+		[ "$total" -gt 0 ] || total=1
+		for d in /tmp/tcloop/*; do
+			[ -d "$d" ] || continue
+			cp -an "$d/." "$MNT/" 2>/dev/null
+			n=$((n+1))
+			[ $((n % 20)) -eq 0 ] && say $(( 86 + 2 * n / total )) "Baking extensions ($n of $total)"
+		done
+		log "baked $n mounted extensions into the target root"
+		# replace remaining links whose target exists
+		for l in $(find "$MNT" -type l 2>/dev/null); do
+			case "$(readlink "$l" 2>/dev/null)" in
+				/tmp/tcloop/*) t="$(readlink "$l")"
+					[ -e "$t" ] && { rm -f "$l"; cp -a "$t" "$l" 2>/dev/null; } ;;
+			esac
+		done
+	fi
+
+	# whatever still points into /tmp/tcloop would be dangling after reboot
+	DEAD=0
+	for l in $(find "$MNT" -type l 2>/dev/null); do
+		case "$(readlink "$l" 2>/dev/null)" in
+			/tmp/tcloop/*) rm -f "$l"; DEAD=$((DEAD+1)) ;;
+		esac
+	done
+	[ "$DEAD" -gt 0 ] && log "dropped $DEAD unresolvable tcloop links"
+
+	# dirs stay for the Store and on-demand loading
+	say 88 "Retiring the per-boot extension pipeline"
+	mkdir -p "$MNT/tce/optional" "$MNT/tce/ondemand"
+	: > "$MNT/tce/onboot.lst"
+	rm -f "$MNT"/tce/optional/*.tcz "$MNT"/tce/optional/*.tcz.md5.txt \
+	      "$MNT"/tce/optional/*.tcz.dep "$MNT"/tce/optional/*.tcz.list 2>/dev/null
+	rm -f "$MNT/tce/copy2fs.lst" "$MNT/tce/xbase.lst" 2>/dev/null
+	chown -R 0:50 "$MNT/tce" 2>/dev/null
+
+	# install2disk never wrote these; without sysconfig/desktop startx skips
+	# setupdesktop (.xsession falls back to flwm, but keep it right)
+	[ -x "$MNT/usr/local/bin/flwm" ] && echo flwm > "$MNT/etc/sysconfig/desktop"
+	[ -x "$MNT/usr/local/bin/wbar" ] && echo wbar > "$MNT/etc/sysconfig/icons"
+	log "desktop=$(cat "$MNT/etc/sysconfig/desktop" 2>/dev/null) icons=$(cat "$MNT/etc/sysconfig/icons" 2>/dev/null)"
+}
+
+# Pre-render the framed dock icons in the target. --frame-icon exits 0 even
+# when the source didn't load, and xxri-dock-pin would keep those empty frames
+# forever (eight blank dock slots once). All identical = failed: drop them and
+# let the desktop retry.
+bake_dock_icons() {
+	say 89 "Preparing dock icons"
+	FRAMED="$MNT/usr/local/share/xxri-launcher/framed"
+	PINNED="$MNT/usr/local/share/xxri-launcher/pinned.list"
+	APPS="$MNT/usr/local/share/applications"
+	[ -x "$MNT/usr/local/bin/xxri-launcher" ] && [ -s "$PINNED" ] || {
+		log "no framer or pinned.list on target - dock icons left to first boot"; return; }
+	mkdir -p "$FRAMED"
+	made=""
+	grep -v '^#' "$PINNED" | grep . | while read id; do
+		dsk="$APPS/$id.desktop"
+		[ -f "$dsk" ] || continue
+		icon="$(sed -n 's/^X-FullPathIcon=//p' "$dsk" | head -1)"
+		if [ -z "$icon" ] || [ ! -f "$MNT$icon" ]; then
+			nm="$(sed -n 's/^Icon=//p' "$dsk" | head -1)"
+			for e in png svg xpm; do
+				[ -f "$MNT/usr/local/share/pixmaps/$nm.$e" ] && \
+					{ icon="/usr/local/share/pixmaps/$nm.$e"; break; }
+			done
+		fi
+		[ -n "$icon" ] && [ -f "$MNT$icon" ] || continue
+		chroot "$MNT" /usr/local/bin/xxri-launcher --frame-icon \
+			"$icon" "/usr/local/share/xxri-launcher/framed/$id.png" 64 \
+			>/dev/null 2>&1
+		chmod 644 "$FRAMED/$id.png" 2>/dev/null
+	done
+	n=$(ls "$FRAMED"/*.png 2>/dev/null | wc -l)
+	uniq_n=$(md5sum "$FRAMED"/*.png 2>/dev/null | awk '{print $1}' | sort -u | wc -l)
+	if [ "$n" -ge 2 ] && [ "$uniq_n" -lt 2 ]; then
+		rm -f "$FRAMED"/*.png
+		log "framer produced $n identical icons (source images did not load) - cache cleared for first boot"
+	else
+		log "dock icons prepared: $n rendered, $uniq_n distinct"
+	fi
+}
+
+find_kernel_src() {
+	# live: sysconfig/cde is "<medium>/cde/optional", boot is <medium>/boot
+	# (two levels up); installed: /boot
+	if [ -s /etc/sysconfig/cde ]; then
+		CDE="$(cat /etc/sysconfig/cde)"
+		CDE="${CDE%/}"; CDE="${CDE%/optional}"
+		B="$(dirname "$CDE")/boot"
+		[ -f "$B/vmlinuz" ] && [ -f "$B/core.gz" ] && { echo "$B"; return; }
+	fi
+	[ -f /boot/vmlinuz ] && [ -f /boot/core.gz ] && { echo /boot; return; }
+	for m in /mnt/*/boot; do
+		[ -f "$m/vmlinuz" ] && [ -f "$m/core.gz" ] && { echo "$m"; return; }
+	done
+	echo ""
+}
+
+# ---------------------------------------------------------- boot loader --
+#
+# GRUB 2.14, the same build that boots the ISO. EXTLINUX put the initrd as
+# high as initrd_addr_max allows, which corrupted core.gz on the NEC VK24MX,
+# and can't do GPT or IA32 UEFI. GRUB places the initrd from the firmware
+# memory map (BIOS) or leaves it to the EFI stub. Don't add mem=, an address
+# or a memory ceiling anywhere - the NEC depends on that.
+#
+# Tools are loaded from the medium for the install only: xxri-grub, gdisk,
+# dosfstools, efivar, efibootmgr.
+GRUBLIB=/usr/local/lib/grub
+
+load_install_tools() {
+	CDEOPT=""
+	[ -s /etc/sysconfig/cde ] && CDEOPT="$(cat /etc/sysconfig/cde)" && CDEOPT="${CDEOPT%/}"
+	[ -d "$CDEOPT" ] || CDEOPT="$(dirname "$(find_kernel_src)")/cde/optional"
+	TCU="$(cat /etc/sysconfig/tcuser 2>/dev/null)"
+	for e in xxri-grub gdisk dosfstools efivar efibootmgr; do
+		[ -e "/usr/local/tce.installed/$e" ] && continue
+		[ -f "$CDEOPT/$e.tcz" ] || { log "extension $e.tcz not found on the medium"; continue; }
+		# tce-load refuses to run as root
+		su "${TCU:-xxri}" -c "tce-load -i '$CDEOPT/$e.tcz'" >/dev/null 2>&1 ||
+			log "tce-load $e failed"
+	done
+	[ -x /usr/local/sbin/grub-install ] && [ -d "$GRUBLIB/i386-pc" ] ||
+		fail "GRUB is not available (xxri-grub.tcz missing from the medium)"
+}
+
+mbr_type() { # $1 disk, $2 primary partition 1-4 -> its MBR type byte, e.g. "ef"
+	# from the table itself: busybox and util-linux fdisk -l differ
+	dd if="$1" bs=1 skip=$((446 + 16 * ($2 - 1) + 4)) count=1 2>/dev/null | od -An -tx1 | tr -d ' \n'
+}
+
+esp_of() { # $1 disk -> first EFI system partition on it (GPT EF00 / MBR 0xEF)
+	n=""
+	if is_gpt "$1"; then
+		n=$(sgdisk -p "$1" 2>/dev/null | awk '$6 == "EF00" { print $1; exit }')
+	else
+		for i in 1 2 3 4; do [ "$(mbr_type "$1" $i)" = ef ] && { n=$i; break; }; done
+	fi
+	[ -n "$n" ] && part_dev "$1" "$n"
+}
+
+has_bios_boot() { # $1 disk: GPT with a BIOS boot partition (EF02) for GRUB's core image
+	is_gpt "$1" && sgdisk -p "$1" 2>/dev/null | awk '$6 == "EF02" { f = 1 } END { exit !f }'
+}
+
+write_grub_cfg() { # $1 root filesystem UUID
+	mkdir -p "$MNT/boot/grub"
+	# live boot codes minus cde; the splash mode comes from gfxpayload
+	# (vga= doesn't exist on UEFI)
+	cat > "$MNT/boot/grub/grub.cfg" <<EOF
+# XXRI OS Lite - installed system.  Written by xxri-install-backend.
+set default=0
+# no menu on a normal boot; Esc (or F4) during this second shows it
+set timeout_style=hidden
+set timeout=1
+set menu_color_normal=light-gray/black
+set menu_color_highlight=white/magenta
+insmod part_msdos
+insmod part_gpt
+insmod ext2
+search --no-floppy --fs-uuid --set=root $1
+if [ "\$grub_platform" = "efi" ]; then
+	insmod efi_gop
+	insmod efi_uga
+	set gfxpayload=keep
+else
+	insmod vbe
+	insmod vga
+	set gfxpayload=1024x768x32,1024x768x16,1024x768,auto
+fi
+
+menuentry "XXRI OS Lite" --id xxri {
+	linux /boot/vmlinuz quiet loglevel=3 vt.global_cursor_default=0 consoleblank=0
+	initrd ${UCODE}/boot/core.gz
+}
+menuentry "XXRI OS Lite (safe graphics)" --id xxri-safegfx {
+	linux /boot/vmlinuz quiet loglevel=3 vt.global_cursor_default=0 consoleblank=0 nomodeset
+	initrd ${UCODE}/boot/core.gz
+}
+menuentry "XXRI OS Lite (verbose boot)" --id xxri-verbose {
+	linux /boot/vmlinuz loglevel=7
+	initrd ${UCODE}/boot/core.gz
+}
+if [ "\$grub_platform" = "efi" ]; then
+	menuentry "UEFI firmware settings" --id uefi-firmware {
+		fwsetup
+	}
+fi
+EOF
+}
+
+# Microcode (rules/xxri-ucode.make): install only this CPU's vendor image
+# (Intel's is 15 MB read every boot). On another vendor's CPU it still boots,
+# just without microcode. VIA/Zhaoxin/Hygon have none.
+ucode_vendor() {
+	case "$(sed -n 's/^vendor_id[[:space:]]*: *//p' /proc/cpuinfo | head -n 1)" in
+		GenuineIntel) echo intel ;;
+		AuthenticAMD) echo amd ;;
+	esac
+}
+
+install_bootloader() { # $1 partition, $2 disk, $3 partnum
+	say 90 "Installing boot loader (GRUB)"
+	KSRC="$(find_kernel_src)"
+	[ -n "$KSRC" ] || fail "cannot locate vmlinuz/core.gz to install"
+	mkdir -p "$MNT/boot"
+	cp -f "$KSRC/vmlinuz" "$MNT/boot/vmlinuz" || fail "kernel copy failed"
+	cp -f "$KSRC/core.gz" "$MNT/boot/core.gz" || fail "initrd copy failed"
+	UCODE=""
+	UV="$(ucode_vendor)"
+	if [ -n "$UV" ] && [ -f "$KSRC/$UV-ucode.img" ]; then
+		cp -f "$KSRC/$UV-ucode.img" "$MNT/boot/$UV-ucode.img" || fail "microcode copy failed"
+		cp -f "$KSRC/LICENSE.$UV-ucode" "$MNT/boot/" 2>/dev/null
+		UCODE="/boot/$UV-ucode.img "
+		log "CPU microcode: $UV-ucode.img"
+	else
+		log "CPU microcode: none for this CPU (vendor '${UV:-other}')"
+	fi
+	RUUID="$(blkid "$1" 2>/dev/null | sed -n 's/.* UUID="\([^"]*\)".*/\1/p')"
+	[ -n "$RUUID" ] || fail "cannot read the filesystem UUID of $1"
+	write_grub_cfg "$RUUID"
+	GI="grub-install --boot-directory=$MNT/boot --fonts= --locales= --themes="
+
+	# also on GPT with a BIOS boot partition, so the disk boots on both
+	if [ "$FW" = bios ] || has_bios_boot "$2"; then
+		if is_gpt "$2" && ! has_bios_boot "$2"; then
+			fail "$2 uses GPT but has no BIOS boot partition (type EF02) for GRUB - use automatic partitioning or add a 1 MiB EF02 partition"
+		fi
+		say 92 "Writing BIOS boot code"
+		$GI --target=i386-pc --directory=$GRUBLIB/i386-pc "$2" >/tmp/xxri-grub-pc.log 2>&1 || {
+			log "$(tail -2 /tmp/xxri-grub-pc.log | tr '\n' ' ')"
+			fail "GRUB could not be installed for BIOS on $2 (the gap before the first partition may be too small)"
+		}
+		is_gpt "$2" || set_bootflag "$2" "$3"
+	fi
+
+	if [ "$FW" = efi32 ] || [ "$FW" = efi64 ]; then
+		# GRUB's EFI platform and the removable-media loader name of this firmware
+		if [ "$FW" = efi64 ]; then EFIT=x86_64-efi EFIN=x64; else EFIT=i386-efi EFIN=ia32; fi
+		EFIB=$(echo "$EFIN" | tr a-z A-Z)
+		ESPDEV="${AUTOESP:-$(esp_of "$2")}"
+		[ -b "$ESPDEV" ] || fail "no EFI system partition on $2 - use automatic partitioning or create one (FAT32, type EF00)"
+		say 94 "Writing UEFI boot loader"
+		ESPMNT="/mnt/xxri-esp.$$"
+		mkdir -p "$ESPMNT"
+		mount -t vfat "$ESPDEV" "$ESPMNT" || fail "cannot mount the EFI system partition $ESPDEV"
+		# A boot entry in firmware NVRAM when efivarfs is writable ...
+		NV=--no-nvram
+		grep -q efivarfs /proc/filesystems && ! grep -q ' /sys/firmware/efi/efivars ' /proc/mounts &&
+			mount -t efivarfs efivarfs /sys/firmware/efi/efivars 2>/dev/null
+		command -v efibootmgr >/dev/null && [ -w /sys/firmware/efi/efivars ] && NV=""
+		$GI --target=$EFIT --directory=$GRUBLIB/$EFIT --efi-directory="$ESPMNT" \
+			--bootloader-id=XXRI $NV >/tmp/xxri-grub-efi.log 2>&1 || {
+			log "$(tail -2 /tmp/xxri-grub-efi.log | tr '\n' ' ')"
+			umount "$ESPMNT"; fail "GRUB could not be installed for UEFI on $ESPDEV"
+		}
+		[ -n "$NV" ] && log "no writable EFI variables - relying on the removable-media path"
+		# ... and always the removable-media path EFI/BOOT/BOOT<IA32|X64>.EFI,
+		# which firmware finds without any NVRAM entry.  Never replace another OS's.
+		mkdir -p "$ESPMNT/EFI/BOOT"
+		if [ -n "$AUTOESP" ] || [ ! -e "$ESPMNT/EFI/BOOT/BOOT$EFIB.EFI" ]; then
+			cp -f "$ESPMNT/EFI/XXRI/grub$EFIN.efi" "$ESPMNT/EFI/BOOT/BOOT$EFIB.EFI"
+		else
+			log "kept the existing EFI/BOOT/BOOT$EFIB.EFI; XXRI is EFI/XXRI/grub$EFIN.efi"
+		fi
+		sync; umount "$ESPMNT"; rmdir "$ESPMNT"
+	fi
+	log "boot loader: GRUB $(grub-install --version | awk '{print $NF}') firmware=$FW disk=$2 root=UUID=$RUUID"
+}
+
+# run
+run_install() {
+	[ -r "$1" ] || fail "config file missing"
+	. "$1"
+	[ "$(id -u)" = 0 ] || fail "backend must run as root"
+	PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+
+	FW=$(firmware)
+	log "firmware: $FW"
+	if [ "$(uname -m)" = x86_64 ]; then
+		[ "$FW" = efi32 ] && fail "this machine started XXRI through 32-bit UEFI; the 64-bit (x86_64) XXRI 2.6 can only be installed to start from BIOS/CSM (legacy) or 64-bit UEFI firmware"
+	else
+		[ "$FW" = efi64 ] && fail "this machine started XXRI through 64-bit UEFI; the 32-bit (i686) XXRI 2.6 can only be installed to start from BIOS/CSM (legacy) or 32-bit UEFI firmware"
+	fi
+	load_install_tools
+	sgdisk --version >/dev/null 2>&1 || fail "sgdisk does not run (gdisk.tcz needs popt.tcz)"
+
+	if [ "$MODE" = "auto" ]; then
+		[ -b "$DISK" ] || fail "target disk $DISK not found"
+		# refuse to nuke the disk we are running from
+		LIVE=$(awk '$2=="/" {print $1}' /proc/mounts)
+		case "$LIVE" in "$DISK"*) fail "cannot install onto the running system disk";; esac
+		case " $(medium_disks | tr '\n' ' ') " in
+			*" ${DISK##*/} "*) fail "$DISK holds the system XXRI was started from" ;;
+		esac
+		for p in $(awk -v d="$DISK" '$1 ~ d {print $1}' /proc/mounts); do
+			umount "$p" 2>/dev/null
+		done
+		say 3 "Preparing $DISK"
+		auto_partition "$DISK"
+		PART="$AUTOPART"
+		DISKDEV="$DISK"; PARTNUM=$AUTONUM
+	else
+		[ -b "$PART" ] || fail "target partition $PART not found"
+		case "$PART" in
+			*nvme*p[0-9]*|*mmcblk*p[0-9]*) DISKDEV="${PART%p[0-9]*}"; PARTNUM="${PART##*p}" ;;
+			*) DISKDEV="$(echo "$PART" | sed 's/[0-9]*$//')"; PARTNUM="$(echo "$PART" | sed 's/^.*[^0-9]//')" ;;
+		esac
+		LIVE=$(awk '$2=="/" {print $1}' /proc/mounts)
+		[ "$LIVE" = "$PART" ] && fail "cannot install onto the running root partition"
+		umount "$PART" 2>/dev/null
+	fi
+
+	say 10 "Formatting $PART (ext4, label XXRIROOT)"
+	format_target "$PART"
+	copy_system "$PART"
+
+	mount_target "$PART"
+	configure_user
+	configure_system
+	bake_extensions
+	bake_dock_icons
+	install_bootloader "$PART" "$DISKDEV" "$PARTNUM"
+
+	say 97 "Finalizing"
+	sync
+	UUID="$(blkid -o export "$PART" 2>/dev/null | awk -F= '/^UUID/{print $2}')"
+	cleanup
+	say 100 "Installation complete"
+	echo "DONE|$UUID"
+}
+
+case "$1" in
+	list-disks) list_disks ;;
+	list-parts) list_parts ;;
+	run) shift; run_install "$1" ;;
+	*) echo "usage: xxri-install-backend list-disks|list-parts|run <cfg>" >&2; exit 1 ;;
+esac

@@ -1,0 +1,85 @@
+#!/bin/busybox ash
+# xxri-hw-init - boot-time hardware enablement (called from bootlocal.sh).
+# Loads drivers, restores saved audio/power settings and caches the display
+# modes before X starts. Best-effort and quiet.
+{
+	# Extension modules live in /usr/local/lib/modules (kernel.tclocal link).
+	# Live boots depmod when a module package loads, installed systems don't,
+	# so index once here. Check content, not mtime (unsquashfs keeps package
+	# timestamps).
+	if [ -d "/usr/local/lib/modules/$(uname -r)" ] && \
+	   ! grep -q 'kernel\.tclocal' "/lib/modules/$(uname -r)/modules.dep" 2>/dev/null; then
+		depmod -a 2>/dev/null
+	fi
+	# USB host controllers and storage HBAs are modular on some builds
+	. /usr/local/lib/xxri/hw-lib.sh
+	for d in $(pci_by_class 0x0c03) $(pci_by_class 0x01); do
+		hw_load_driver "$d"
+	done
+	# KMS driver before X, or modesetting finds no screen and the session
+	# falls back to Xfbdev. Every display class 0x03xx (VGA, and the 3D /
+	# "other" controllers of hybrid laptop GPUs); VM adapters by name.
+	# The splash must let go of /dev/fb0 meanwhile (xxri-splash-handover;
+	# xxri-setup paused it for the udev trigger).
+	if [ ! -e /dev/dri/card0 ]; then
+		/usr/local/sbin/xxri-splash-handover pause
+		for d in $(pci_by_class 0x03); do hw_load_driver "$d"; done
+		[ -e /dev/dri/card0 ] || for m in bochs cirrus qxl vmwgfx vboxvideo virtio-gpu simpledrm; do
+			modprobe "$m" 2>/dev/null && [ -e /dev/dri/card0 ] && break
+		done
+	fi
+	/usr/local/sbin/xxri-splash-handover resume
+	# (no-SSE2 CPUs: ~/.xsession keeps the X servers off Mesa, see nosse2)
+	/usr/local/bin/xxri-display cache-modes
+	/usr/local/bin/xxri-audio init
+	G="$(sed -n 's/^GOVERNOR=//p' /usr/local/etc/xxri/power.conf 2>/dev/null)"
+	[ -n "$G" ] && /usr/local/bin/xxri-power governor set "$G"
+	B="$(sed -n 's/^BRIGHTNESS=//p' /usr/local/etc/xxri/power.conf 2>/dev/null)"
+	[ -n "$B" ] && /usr/local/bin/xxri-power brightness set "$B"
+	# Saved Wi-Fi networks can take ~20 s to answer, and the launcher clean-up
+	# below has to happen before the session builds its menu. Bluetooth starts
+	# only with an adapter present and not switched off in Settings.
+	/usr/local/bin/xxri-network auto &
+	/usr/local/bin/xxri-bluetooth auto &
+	# No GTK/glib/gio caches here: each extension's install script rebuilds
+	# its own when loaded (xxri-refresh-caches only runs after Store installs).
+	# Drop Tiny Core launchers XXRI replaces before the session builds the
+	# dock/menu: control panel and config tools (Settings), package browsers
+	# (the Store; the tce backend stays), Exit (power menu), RunProgram, Top,
+	# Xkill and the terminal Wi-Fi script.
+	for junk in cpanel tc-cpanel tc-config appsaudit services settime tc-wbarconf \
+	            apps appbrowser tce tce-ab appsrepo \
+	            exittc flrun top xkill wifi; do
+		rm -f "/usr/local/share/applications/tinycore-$junk.desktop" \
+		      "/usr/local/share/applications/$junk.desktop" 2>/dev/null
+	done
+	rm -f /usr/local/share/pixmaps/cpanel.png \
+	      /usr/local/bin/apps /usr/local/bin/appbrowser 2>/dev/null
+	# editor lives on under an XXRI name; mnttool never maps a window here,
+	# Disks opens Settings > Storage instead
+	rm -f /usr/local/share/applications/tinycore-editor.desktop \
+	      /usr/local/share/applications/tinycore-screenshot.desktop \
+	      /usr/local/share/applications/tinycore-mnttool.desktop 2>/dev/null
+
+	# CA bundle for the Store's HTTPS: ca-certificates.tcz builds it when
+	# loaded, an image with unsquashed extensions never runs that hook
+	if [ ! -s /usr/local/etc/ssl/certs/ca-certificates.crt ] && \
+	   [ -d /usr/local/share/ca-certificates ]; then
+		mkdir -p /usr/local/etc/ssl/certs
+		find /usr/local/share/ca-certificates -name '*.crt' -exec cat {} + \
+			> /usr/local/etc/ssl/certs/ca-certificates.crt 2>/dev/null
+		ln -sf /usr/local/etc/ssl/certs/ca-certificates.crt /usr/local/etc/ssl/cacert.pem 2>/dev/null
+		ln -sf /usr/local/etc/ssl/certs/ca-certificates.crt /usr/local/etc/ssl/ca-bundle.crt 2>/dev/null
+	fi
+	# installed system (root not rootfs/tmpfs): no installer anywhere
+	case "$(awk '$2=="/"{print $3; exit}' /proc/mounts)" in
+		rootfs|tmpfs) ;;
+		*)
+			rm -f /usr/local/share/applications/xxri-installer.desktop \
+			      /usr/local/bin/xxri-installer 2>/dev/null
+			for u in /home/*; do
+				rm -f "$u"/.X.d/xxri-installer-live \
+				      "$u"/.wmx/*/InstallxxriOSLite "$u"/.wmx/*/Install* 2>/dev/null
+			done ;;
+	esac
+} >/var/log/xxri-hw-init.log 2>&1

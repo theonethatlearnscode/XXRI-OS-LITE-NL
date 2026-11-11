@@ -1,0 +1,2583 @@
+/* xxri-store-gui - the XXRI Store, GTK3 frontend only.
+ *
+ * Catalog, network and install work all go through the xxri-store engine
+ * (which hands AppImages to xxri-app). Nothing here downloads, mounts or
+ * writes .desktop files.
+ */
+#include <gtk/gtk.h>
+#define GETTEXT_PACKAGE "xxri-store"
+#include "xxri-i18n.h"
+#include "xxri-chrome.h"
+#include "xxri-dialog.h"
+#include "xxri-theme.h"
+#include <cairo.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <dirent.h>
+#include <math.h>
+#include <glib/gstdio.h>
+
+#define STORE_DIR "/usr/local/share/xxri-store"
+#define ICON_DIR  STORE_DIR "/icons"
+
+/* PNG through cairo: TC's gdk-pixbuf built-in PNG loader is broken. Anything
+ * else (some repo icons are SVG) goes to gdk-pixbuf's loaders.cache loaders. */
+static GdkPixbuf* load_png(const char* path, int w, int h) {
+    cairo_surface_t* s = cairo_image_surface_create_from_png(path);
+    if (cairo_surface_status(s) != CAIRO_STATUS_SUCCESS) {
+        cairo_surface_destroy(s);
+        GError* e = NULL;
+        GdkPixbuf* pb = (w > 0)
+            ? gdk_pixbuf_new_from_file_at_scale(path, w, h, TRUE, &e)
+            : gdk_pixbuf_new_from_file(path, &e);
+        if (e) g_error_free(e);
+        return pb;                 /* NULL only if no loader understands it */
+    }
+    int sw = cairo_image_surface_get_width(s), sh = cairo_image_surface_get_height(s);
+    GdkPixbuf* full = gdk_pixbuf_get_from_surface(s, 0, 0, sw, sh);
+    cairo_surface_destroy(s);
+    if (!full) return NULL;
+    if (w > 0 && (sw != w || sh != h)) {
+        GdkPixbuf* sc = gdk_pixbuf_scale_simple(full, w, h, GDK_INTERP_BILINEAR);
+        g_object_unref(full); return sc;
+    }
+    return full;
+}
+
+/* XXRI_STORE_DEBUG=1 -> ~/xxri-store-debug.log (no terminal from the dock) */
+static void dbg(const char* fmt, ...) {
+    static FILE* f = NULL;
+    if (!g_getenv("XXRI_STORE_DEBUG")) return;
+    if (!f) {
+        const char* h = g_getenv("HOME");
+        char p[512]; snprintf(p,sizeof p,"%s/xxri-store-debug.log", h?h:"/tmp");
+        f = fopen(p,"a");
+        if (!f) return;
+        setvbuf(f, NULL, _IOLBF, 0);
+    }
+    va_list ap; va_start(ap,fmt);
+    vfprintf(f,fmt,ap); va_end(ap);
+    fputc('\n',f); fflush(f);
+}
+
+static char* run_cmd(const char* fmt, ...) {
+    char cmd[2048]; va_list ap; va_start(ap, fmt);
+    vsnprintf(cmd, sizeof cmd, fmt, ap); va_end(ap);
+    char full[2100]; snprintf(full, sizeof full, "%s 2>/dev/null", cmd);
+    FILE* f = popen(full, "r"); if (!f) return g_strdup("");
+    GString* s = g_string_new(""); char buf[4096]; size_t n;
+    while ((n = fread(buf,1,sizeof buf,f)) > 0) g_string_append_len(s, buf, n);
+    pclose(f);
+    while (s->len && (s->str[s->len-1]=='\n' || s->str[s->len-1]=='\r')) g_string_truncate(s, s->len-1);
+    return g_string_free(s, FALSE);
+}
+/* XXRI_GUI_TRACE: install-path trace to stderr and to install-trace.log,
+   interleaved with the backend's lines */
+static void gtrace(const char* fmt, ...) {
+    if (!g_getenv("XXRI_GUI_TRACE")) return;
+    char msg[1024]; va_list ap; va_start(ap,fmt);
+    vsnprintf(msg,sizeof msg,fmt,ap); va_end(ap);
+    fprintf(stderr,"GUI-TRACE %s\n",msg); fflush(stderr);
+    const char* h=g_getenv("HOME");
+    if (h) { char pth[512]; snprintf(pth,sizeof pth,"%s/.cache/xxri-store/install-trace.log",h);
+        FILE* f=fopen(pth,"a"); if(f){ fprintf(f,"%-8s %-20s %s\n","gui","stage",msg); fclose(f);} }
+}
+
+/* fire-and-forget: the UI must never block on the network */
+static void run_bg(const char* fmt, ...) {
+    char cmd[2048]; va_list ap; va_start(ap, fmt);
+    vsnprintf(cmd, sizeof cmd, fmt, ap); va_end(ap);
+    char* argv[4] = { (char*)"/bin/sh", (char*)"-c", cmd, NULL };
+    GError* err=NULL;
+    gboolean ok = g_spawn_async(NULL, argv, NULL, G_SPAWN_SEARCH_PATH | G_SPAWN_STDOUT_TO_DEV_NULL |
+                  G_SPAWN_STDERR_TO_DEV_NULL, NULL, NULL, NULL, &err);
+    gtrace("run_bg spawn=%s cmd=[%s]%s%s", ok?"OK":"FAILED", cmd,
+           err?" err=":"", err?err->message:"");
+    if (err) g_error_free(err);
+}
+
+/* flat-JSON helpers like Settings'; jfind allows whitespace around ':' for the
+ * pretty-printed remote catalog */
+static const char* jfind(const char* doc, const char* key, char want) {
+    char pat[128]; snprintf(pat,sizeof pat,"\"%s\"",key);
+    size_t pl=strlen(pat);
+    const char* p=doc;
+    while ((p=strstr(p,pat))) {
+        const char* q=p+pl;
+        while (*q==' '||*q=='\t'||*q=='\n'||*q=='\r') q++;
+        if (*q!=':') { p+=pl; continue; }
+        q++;
+        while (*q==' '||*q=='\t'||*q=='\n'||*q=='\r') q++;
+        if (want && *q!=want) { p+=pl; continue; }
+        return q;
+    }
+    return NULL;
+}
+static char* jget(const char* doc, const char* key) {
+    const char* p = jfind(doc,key,0); if(!p) return g_strdup("");
+    if(*p=='"'){ p++; const char* e=p; while(*e && !(*e=='"'&&e[-1]!='\\'))e++;
+        GString* s=g_string_new_len(NULL,0);
+        for(const char* c=p;c<e;c++){
+            if(*c=='\\'&&c+1<e){ c++;
+                g_string_append_c(s, *c=='n'?'\n' : *c=='t'?'\t' : *c=='r'?'\r' : *c);
+            } else g_string_append_c(s,*c);
+        }
+        return g_string_free(s,FALSE);
+    }
+    const char* e=p; while(*e && *e!=','&&*e!='}'&&*e!=']')e++;
+    return g_strndup(p,e-p);
+}
+/* scalar at the top level of one object only: each app's "sources" array
+   repeats keys like "version" and "priority" */
+static char* jtop(const char* obj, const char* key) {
+    size_t klen = strlen(key);
+    int depth = 0, instr = 0;
+    for (const char* p = obj; *p; p++) {
+        if (instr) { if (*p=='\\') { p++; continue; } if (*p=='"') instr=0; continue; }
+        if (*p=='"') {
+            if (depth == 1 && !strncmp(p+1,key,klen) && p[1+klen]=='"') {
+                const char* q = p+2+klen;
+                while (*q==' '||*q=='\t') q++;
+                if (*q==':') {
+                    q++; while (*q==' '||*q=='\t') q++;
+                    if (*q=='{'||*q=='[') return g_strdup("");   /* structured */
+                    if (*q=='"') {
+                        q++; GString* g = g_string_new(NULL);
+                        for (; *q && *q!='"'; q++) {
+                            if (*q=='\\' && q[1]) { q++;
+                                g_string_append_c(g, *q=='n'?'\n' : *q=='t'?'\t' : *q=='r'?'\r' : *q);
+                            } else g_string_append_c(g,*q);
+                        }
+                        return g_string_free(g,FALSE);
+                    }
+                    const char* e = q;
+                    while (*e && *e!=','&&*e!='}'&&*e!=']'&&*e!='\n') e++;
+                    while (e>q && (e[-1]==' '||e[-1]=='\t'||e[-1]=='\r')) e--;
+                    return g_strndup(q,e-q);
+                }
+            }
+            instr = 1; continue;
+        }
+        if (*p=='{'||*p=='[') depth++;
+        if (*p=='}'||*p==']') depth--;
+    }
+    return g_strdup("");
+}
+
+static GPtrArray* jarr(const char* doc, const char* key) {
+    GPtrArray* v = g_ptr_array_new_with_free_func(g_free);
+    const char* p=jfind(doc,key,'['); if(!p) return v; p++;
+    int depth=0, instr=0; const char* start=NULL;
+    for(const char* i=p;*i;i++){
+        if(instr){ if(*i=='\\'){ i++; continue; } if(*i=='"') instr=0; continue; }
+        if(*i=='"'){ instr=1; continue; }
+        if(*i=='{'){ if(depth==0)start=i; depth++; }
+        else if(*i=='}'){ depth--; if(depth==0&&start) g_ptr_array_add(v,g_strndup(start,i-start+1)); }
+        else if(*i==']'&&depth==0) break;
+    }
+    return v;
+}
+/* string-array field: "key":["a","b"] -> newline-joined */
+static char* jstrs(const char* doc, const char* key) {
+    const char* p=jfind(doc,key,'['); if(!p) return g_strdup("");
+    p++; const char* e=p; int d=1;
+    while(*e && d){ if(*e=='[')d++; else if(*e==']')d--; if(d)e++; }
+    GString* s=g_string_new(""); const char* c=p;
+    while(c<e){ if(*c=='"'){ c++; const char* q=c; while(*q&&*q!='"')q++;
+            if(s->len)g_string_append_c(s,'\n'); g_string_append_len(s,c,q-c); c=q+1; }
+        else c++; }
+    return g_string_free(s,FALSE);
+}
+
+typedef struct {
+    char *id,*name,*category,*kind,*summary,*description,*developer,*publisher,*license,
+         *homepage,*website,*version,*release_date,*updated,*source_type,*source_ref,
+         *changelog,*icon_url,*arch,*permissions,*deps,*tags,*sha256,*keywords;
+    gint64 size;
+    int rank, nshots;
+    gboolean verified;      /* a real, downloadable asset was confirmed */
+    char *unavailable;      /* non-empty: why this app cannot be installed  */
+} App;
+
+static GPtrArray*   g_apps;          /* all App*                            */
+static GHashTable*  g_byid;          /* id -> App*                          */
+static char*        g_arch = NULL;   /* this device's architecture          */
+static char*        g_repo = NULL;   /* active repository directory         */
+static gboolean     g_repo_offline = FALSE;   /* serving the cached catalog        */
+static gboolean     g_repo_available = FALSE; /* a catalog (fresh or cached) exists  */
+static char*        g_repo_schema  = NULL;    /* schema_version from the catalog     */
+static char*        g_repo_updated = NULL;    /* last_updated from the catalog       */
+static char*        g_repo_kind=NULL;/* "remote" | "cached" | "bundled" (engine status) */
+static char*        g_repo_error=NULL;/* engine status "error": why the catalog or the last refresh failed */
+static char*        g_catalog_path=NULL; /* the catalog file in use, the engine's choice (cache or bundled) */
+static GHashTable*  g_icon_tried;    /* icon id -> when it was last requested (s) */
+static guint        g_icon_timer;    /* the one poll_icons timer, 0 = none  */
+static guint        g_dl_timer;      /* the one poll_downloads timer, 0 = none */
+static char*        g_cache = NULL;  /* ~/.cache/xxri-store                 */
+static gboolean     g_online = FALSE;
+static gint64       g_free_kb = 0;   /* free space on / , refreshed with state */
+static GHashTable*  g_installed;     /* name(lower) -> version              */
+static GHashTable*  g_inst_id;       /* name(lower) -> xxri-app registry id */
+static GHashTable*  g_updates;       /* catalog id -> "cur|latest"          */
+static GHashTable*  g_dlstate;       /* catalog id -> state string          */
+static GHashTable*  g_sections;      /* section -> GPtrArray of App*        */
+static GHashTable*  g_iconcache;     /* "id@size" -> GdkPixbuf*  (real icon)  */
+/* placeholders kept apart, or a cached tile looks like a real icon and the
+   widget never gets queued for the icon fetch */
+static GHashTable*  g_tilecache;     /* "id@size" -> GdkPixbuf*  (placeholder) */
+static GtkWidget   *g_stack, *g_win, *g_search_entry, *g_status_chip, *g_rail;
+static char*        g_page = NULL;   /* current page id                     */
+static GPtrArray*   g_history;       /* page ids for the back button        */
+static GPtrArray*   g_pending_icons; /* IconWant* for the visible page      */
+
+typedef struct { char* id; GtkWidget* img; int size; } IconWant;
+
+static void open_page(const char* id);
+static gboolean app_installable(App* a);
+static void rebuild(const char* id);
+static void refresh_state(void);
+
+static const char* ALL_CATS[]={"browser","office","development","graphics","photography","video","audio",
+    "education","communication","ai","games","utilities","science","finance","security","system",
+    "virtualization","networking","productivity","accessories",NULL};
+static const char* cat_title(const char* id){
+    static const struct{const char*i;const char*t;} M[]={
+     {"browser",N_("Browsers")},{"office",N_("Office")},{"development",N_("Development")},{"graphics",N_("Graphics")},
+     {"photography",N_("Photography")},{"video",N_("Video")},{"audio",N_("Audio")},{"education",N_("Education")},
+     {"communication",N_("Communication")},{"ai",N_("AI")},{"games",N_("Games")},{"utilities",N_("Utilities")},
+     {"science",N_("Science")},{"finance",N_("Finance")},{"security",N_("Security")},{"system",N_("System")},
+     {"virtualization",N_("Virtualization")},{"networking",N_("Networking")},{"productivity",N_("Productivity")},
+     {"accessories",N_("Accessories")},{NULL,NULL}};
+    for (int i=0;M[i].i;i++) if(!strcmp(M[i].i,id)) return _(M[i].t);
+    return id;
+}
+
+/* The repository's category labels are for humans ("Remote Desktop", "IDE");
+   pages, rails and filters are keyed on these slugs. */
+static const char* cat_slug(const char* c) {
+    struct { const char* from; const char* to; } m[] = {
+        {"Browser","browser"},      {"Chat","communication"},   {"Office","office"},
+        {"IDE","development"},      {"Development","development"},
+        {"Graphics","graphics"},    {"Music","audio"},          {"Audio","audio"},
+        {"Video","video"},          {"Multimedia","video"},     {"Emulator","virtualization"},
+        {"Network","networking"},   {"Internet","networking"},  {"Remote Desktop","networking"},
+        {"Utilities","utilities"},  {"Compression","utilities"},{"Science","science"},
+        {"System","system"},        {"PDF","office"},           {"Security","security"},
+        {"Games","games"},          {"Photography","photography"},
+        {NULL,NULL}
+    };
+    if (!c || !*c) return "utilities";
+    for (int i=0;m[i].from;i++) if (!g_ascii_strcasecmp(c,m[i].from)) return m[i].to;
+    /* unknown: lower-cased as is, so new repo categories still group */
+    static char buf[64];
+    g_snprintf(buf,sizeof buf,"%s",c);
+    for (char* q=buf; *q; q++) *q = g_ascii_tolower(*q);
+    return buf;
+}
+
+/* home rails: priority_tier first (lower tier = higher rank), then title */
+static gint cmp_rank_then_name(gconstpointer x, gconstpointer y) {
+    const App* a = *(const App* const*)x;
+    const App* b = *(const App* const*)y;
+    if (a->rank != b->rank) return b->rank - a->rank;
+    return g_ascii_strcasecmp(a->name?a->name:"", b->name?b->name:"");
+}
+
+/* The engine's reason codes, in words. The raw code stays in the tooltip's
+ * last line so a bug report carries it. */
+static const char* why_text(const char* code) {
+    if (!code || !*code) return "";
+    if (!strcmp(code,"no-catalog"))        return _("no catalog has been downloaded yet");
+    if (!strcmp(code,"download-failed"))   return _("the repository did not answer");
+    if (!strcmp(code,"html-page"))         return _("the server sent a web page instead of a catalog");
+    if (!strcmp(code,"truncated"))         return _("the download was incomplete");
+    if (!strncmp(code,"wrong-arch",10))    return _("the server sent the catalog of another architecture");
+    if (!strcmp(code,"unknown-arch"))      return _("this system's architecture could not be determined");
+    return _("the file is not a valid catalog");
+}
+/* why an app without a download cannot be installed here; the 32-bit text is
+ * the one translators already have */
+static char* no_download_msg(void) {
+    if (!g_arch || !strcmp(g_arch,"i686")) return g_strdup(_("No download published for i686"));
+    return g_strdup_printf(_("No download published for %s"), g_arch);
+}
+
+static void load_catalog(void) {
+    if (g_apps) {   /* a refresh replaced the repository - drop the old model */
+        g_ptr_array_free(g_apps, TRUE);
+        g_hash_table_destroy(g_byid);
+        if (g_sections) g_hash_table_destroy(g_sections);
+        if (g_iconcache) g_hash_table_destroy(g_iconcache);
+        if (g_tilecache) g_hash_table_destroy(g_tilecache);
+    }
+    g_apps = g_ptr_array_new();
+    g_byid = g_hash_table_new(g_str_hash, g_str_equal);
+    g_iconcache = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_object_unref);
+    g_tilecache = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_object_unref);
+
+    /* the architecture decides the catalog and which apps fit, so it comes
+       first and is never guessed: unknown stays unknown */
+    if (!g_arch) {
+        char* ar = run_cmd("xxri-store arch");
+        g_arch = jget(ar,"arch"); g_free(ar);
+        if (!g_arch || !*g_arch) { g_free(g_arch); g_arch = g_strdup("unknown"); }
+    }
+    if (g_icon_tried) g_hash_table_remove_all(g_icon_tried);   /* a new catalog: try the icons again */
+
+    g_free(g_repo);
+    g_repo = run_cmd("xxri-store repo-path");
+    if (!*g_repo) { g_free(g_repo); g_repo = g_strdup(STORE_DIR "/repository"); }
+
+    /* this architecture's catalog (i686.json or x64.json): the cached copy or
+       the one bundled with the image, the backend's choice. The only source of
+       truth. Unknown fields are ignored. */
+    g_free(g_catalog_path);
+    g_catalog_path = run_cmd("xxri-store catalog-path");
+    char cpath[1024]; g_strlcpy(cpath,g_catalog_path,sizeof cpath);
+    char* doc=NULL; gsize len;
+    g_repo_available = FALSE;
+    dbg("LOAD_CATALOG repo=%s catalog=%s exists=%d", g_repo, cpath,
+        g_file_test(cpath,G_FILE_TEST_EXISTS));
+    if (g_file_get_contents(cpath,&doc,&len,NULL)) {
+        g_repo_available = TRUE;
+        g_free(g_repo_schema); g_repo_schema = jget(doc,"schema_version");
+        g_free(g_repo_updated); g_repo_updated = jget(doc,"last_updated");
+        GPtrArray* arr = jarr(doc,"applications");
+        for (guint i=0;i<arr->len;i++) {
+            char* o = arr->pdata[i];
+            App* a = g_new0(App,1);
+            a->id          = jtop(o,"id");
+            a->name        = jtop(o,"title");
+            { char* rcat = jtop(o,"category");
+              a->category = g_strdup(cat_slug(rcat));
+              g_free(rcat); }
+            a->description = jtop(o,"description");
+            a->summary     = g_strdup(a->description);
+            a->homepage    = jtop(o,"homepage");
+            a->website     = g_strdup(a->homepage);
+            a->icon_url    = jtop(o,"icon_url");
+            a->arch        = jtop(o,"architecture");
+            a->source_type = jtop(o,"package_type");
+            a->sha256      = jtop(o,"checksum");
+            a->version     = jtop(o,"version");
+            if (!*a->version) { g_free(a->version); a->version = jtop(o,"current_upstream_version"); }
+            a->tags     = jstrs(o,"tags");
+            a->keywords = jstrs(o,"keywords");
+            a->deps     = jstrs(o,"dependencies");
+            a->developer = g_strdup(""); a->publisher = g_strdup("");
+            a->license = g_strdup(""); a->changelog = g_strdup("");
+            a->release_date = g_strdup(""); a->updated = g_strdup("");
+            a->permissions = g_strdup(""); a->source_ref = g_strdup("");
+            char* sz = jtop(o,"size"); a->size = g_ascii_strtoll(sz,NULL,10); g_free(sz);
+            /* "null" is how the schema spells an absent value */
+            if (!strcmp(a->icon_url,"null")) { g_free(a->icon_url); a->icon_url=g_strdup(""); }
+            if (!strcmp(a->sha256,"null"))   { g_free(a->sha256);   a->sha256=g_strdup(""); }
+
+            char* url = jtop(o,"download_url");
+            gboolean has_url = *url && strcmp(url,"null") && g_str_has_prefix(url,"http");
+            char* tier = jtop(o,"priority_tier");
+            /* absent tier is "null": rank 0, not above tier 1 */
+            int tn = (*tier && strcmp(tier,"null")) ? atoi(tier) : 0;
+            a->rank = tn ? (100 - tn*10) : 0;
+            /* packaging from the URL's extension, same rule as the backend
+               (asking `xxri-store field` per app cost seconds at startup) */
+            const char* ext = url;
+            a->kind = g_strdup(
+                (g_str_has_suffix(ext,".AppImage")||g_str_has_suffix(ext,".appimage")) ? "appimage" :
+                 g_str_has_suffix(ext,".tcz")      ? "tcz" :
+                (g_str_has_suffix(ext,".tar.gz") ||g_str_has_suffix(ext,".tgz")   ||
+                 g_str_has_suffix(ext,".tar.xz") ||g_str_has_suffix(ext,".txz")   ||
+                 g_str_has_suffix(ext,".tar.bz2")||g_str_has_suffix(ext,".tbz")   ||
+                 g_str_has_suffix(ext,".zip")    ||g_str_has_suffix(ext,".7z"))   ? "archive" :
+                (g_str_has_suffix(ext,".sh")||g_str_has_suffix(ext,".run")||
+                 g_str_has_suffix(ext,".deb")||g_str_has_suffix(ext,".rpm"))      ? "installer" :
+                 !strcmp(a->source_type,"official_appimage")                      ? "appimage" :
+                 !strcmp(a->source_type,"tinycore_tcz")                           ? "tcz" :
+                                                                                    "archive");
+            gboolean runnable = !strcmp(a->kind,"appimage") || !strcmp(a->kind,"archive")
+                             || !strcmp(a->kind,"tcz");
+            a->verified = has_url && runnable;
+            if (!a->verified) {
+                char* why = jtop(o,"support_status");
+                if (!*why) { g_free(why); why = jtop(o,"research_status"); }
+                if (!has_url)
+                    a->unavailable = *why ? g_strdup(why) : no_download_msg();
+                else
+                    a->unavailable = g_strdup_printf(_("Packaging not supported (%s)"), a->kind);
+                g_free(why);
+            } else a->unavailable = g_strdup("");
+            g_free(url); g_free(tier);
+
+            a->nshots = 0;
+            if (!*a->id) { g_free(a); continue; }
+            g_ptr_array_add(g_apps,a);
+            g_hash_table_replace(g_byid,a->id,a);
+        }
+        g_ptr_array_free(arr,TRUE); g_free(doc);
+        dbg("PARSED size=%u apps=%u schema=%s updated=%s", (unsigned)len,
+            g_apps->len, g_repo_schema?g_repo_schema:"-", g_repo_updated?g_repo_updated:"-");
+    } else dbg("PARSE_FAILED could not read %s", cpath);
+    dbg("REPO_AVAILABLE=%d MODEL_APPS=%u", g_repo_available, g_apps?g_apps->len:0);
+
+    /* home-page sections come from the repository, not from the code */
+    g_sections = g_hash_table_new_full(g_str_hash,g_str_equal,g_free,(GDestroyNotify)g_ptr_array_unref);
+    char sp[1024]; snprintf(sp,sizeof sp,"%s/sections.json",g_repo);
+    char* sdoc=NULL; gsize slen;
+    if (g_file_get_contents(sp,&sdoc,&slen,NULL)) {
+        const char* keys[]={"featured","recommended","trending","editors","newest","updated",NULL};
+        for (int k=0;keys[k];k++) {
+            char* ids = jstrs(sdoc,keys[k]);
+            GPtrArray* v = g_ptr_array_new();
+            char** parts = g_strsplit(ids,"\n",-1);
+            for (int i=0;parts[i];i++) {
+                App* a = g_hash_table_lookup(g_byid,parts[i]);
+                if (a) g_ptr_array_add(v,a);
+            }
+            g_strfreev(parts); g_free(ids);
+            g_hash_table_replace(g_sections,g_strdup(keys[k]),v);
+        }
+        g_free(sdoc);
+    } else {
+        /* the online repo has no sections.json: fill the same keys from the
+           ranking */
+        GPtrArray* pool = g_ptr_array_new();
+        for (guint i=0;i<g_apps->len;i++) {
+            App* a = g_apps->pdata[i];
+            /* not app_visible(): g_installed doesn't exist yet */
+            if (app_installable(a)) g_ptr_array_add(pool,a);
+        }
+        g_ptr_array_sort(pool, cmp_rank_then_name);
+        struct { const char* key; int from, to, step; } S[] = {
+            {"featured",    0,  8, 1},
+            {"recommended", 0, 18, 1},
+            {"trending",    4, 16, 1},
+            {"editors",     0, 24, 3},
+            {"newest",      8, 20, 1},
+            {"updated",     0, 12, 1},
+            {NULL,0,0,0}
+        };
+        for (int k=0;S[k].key;k++) {
+            GPtrArray* v = g_ptr_array_new();
+            for (int i=S[k].from; i<S[k].to && i<(int)pool->len; i+=S[k].step)
+                g_ptr_array_add(v, pool->pdata[i]);
+            g_hash_table_replace(g_sections,g_strdup(S[k].key),v);
+        }
+        g_ptr_array_free(pool,TRUE);
+    }
+}
+
+/* Live state: what is installed, what has an update, what is downloading.
+ * The engine commands are shell scripts, too slow for the GTK thread: the
+ * fetch runs on a worker thread (load_installed_async) and apply_installed()
+ * only parses. */
+static char* g_upd_json;     /* the last `xxri-store updates`, for the Updates page */
+static void apply_installed(const char* js, const char* uj, const char* dj) {
+    if (g_installed) g_hash_table_destroy(g_installed);
+    if (g_inst_id) g_hash_table_destroy(g_inst_id);
+    g_installed = g_hash_table_new_full(g_str_hash,g_str_equal,g_free,g_free);
+    g_inst_id   = g_hash_table_new_full(g_str_hash,g_str_equal,g_free,g_free);
+    GPtrArray* a = jarr(js,"apps");
+    for (guint i=0;i<a->len;i++) {
+        char* o=a->pdata[i];
+        char* nm=jget(o,"name"); char* vr=jget(o,"version"); char* rid=jget(o,"id");
+        char* low=g_ascii_strdown(nm,-1);
+        g_hash_table_replace(g_installed,g_strdup(low),g_strdup(vr));
+        g_hash_table_replace(g_inst_id,low,g_strdup(rid));
+        g_free(nm);g_free(vr);g_free(rid);
+    }
+    g_ptr_array_free(a,TRUE);
+
+    if (g_updates) g_hash_table_destroy(g_updates);
+    g_updates = g_hash_table_new_full(g_str_hash,g_str_equal,g_free,g_free);
+    g_free(g_upd_json); g_upd_json = g_strdup(uj);
+    GPtrArray* u = jarr(uj,"updates");
+    for (guint i=0;i<u->len;i++) {
+        char* o=u->pdata[i];
+        char* cid=jget(o,"catalog_id"); char* cur=jget(o,"current"); char* lat=jget(o,"latest");
+        if (*cid) g_hash_table_replace(g_updates,g_strdup(cid),g_strdup_printf("%s|%s",cur,lat));
+        g_free(cid);g_free(cur);g_free(lat);
+    }
+    g_ptr_array_free(u,TRUE);
+
+    if (g_dlstate) g_hash_table_destroy(g_dlstate);
+    g_dlstate = g_hash_table_new_full(g_str_hash,g_str_equal,g_free,g_free);
+    GPtrArray* dl = jarr(dj,"downloads");
+    for (guint i=0;i<dl->len;i++) {
+        char* o=dl->pdata[i];
+        char* id=jget(o,"id"); char* st=jget(o,"state");
+        g_hash_table_replace(g_dlstate,id,st);
+    }
+    g_ptr_array_free(dl,TRUE);
+}
+/* blocking: only for the user's own click (remove, retry) and --dump */
+static void load_installed(void) {
+    char* js = run_cmd("xxri-store installed");
+    char* uj = run_cmd("xxri-store updates");
+    char* dj = run_cmd("xxri-store downloads");
+    apply_installed(js,uj,dj);
+    g_free(js); g_free(uj); g_free(dj);
+}
+
+typedef struct { char *inst, *upd, *dl; } LiveFetch;
+static gboolean g_live_busy;
+static void live_fetch_free(gpointer p) { LiveFetch* f=p; g_free(f->inst); g_free(f->upd); g_free(f->dl); g_free(f); }
+static void live_fetch_thread(GTask* t, gpointer so, gpointer td, GCancellable* c) {
+    (void)so; (void)c;
+    LiveFetch* f = td;                       /* no GTK in here: shell commands only */
+    f->inst = run_cmd("xxri-store installed");
+    f->upd  = run_cmd("xxri-store updates");
+    f->dl   = run_cmd("xxri-store downloads");
+    g_task_return_boolean(t, TRUE);
+}
+static void live_fetch_done(GObject* so, GAsyncResult* r, gpointer u) {
+    (void)so; (void)u;
+    LiveFetch* f = g_task_get_task_data(G_TASK(r));
+    g_live_busy = FALSE;
+    apply_installed(f->inst, f->upd, f->dl);
+    if (g_rail) gtk_widget_queue_draw(g_rail);       /* updates badge dot */
+    /* re-render whatever the user is looking at; the downloads page refreshes
+     * itself (its own poller), so leave it alone to keep progress smooth */
+    if (g_page && strcmp(g_page,"downloads")) rebuild(g_page);
+}
+static void load_installed_async(void) {
+    if (g_live_busy) return;
+    g_live_busy = TRUE;
+    GTask* t = g_task_new(NULL, NULL, live_fetch_done, NULL);
+    g_task_set_task_data(t, g_new0(LiveFetch,1), live_fetch_free);
+    g_task_run_in_thread(t, live_fetch_thread);
+    g_object_unref(t);
+}
+
+static gboolean app_installed(App* a) {
+    char* low=g_ascii_strdown(a->name,-1);
+    gboolean r=g_hash_table_contains(g_installed,low); g_free(low); return r;
+}
+static const char* installed_id(App* a) {
+    char* low=g_ascii_strdown(a->name,-1);
+    const char* r=g_hash_table_lookup(g_inst_id,low); g_free(low); return r;
+}
+static gboolean app_compatible(App* a) {
+    char** v=g_strsplit(a->arch,"\n",-1); gboolean ok=FALSE;
+    for (int i=0;v[i];i++) if (!strcmp(v[i],g_arch)||!strcmp(v[i],"any")) ok=TRUE;
+    g_strfreev(v); return ok;
+}
+/* Most catalog apps are x86_64/aarch64. Shown: what this device can install
+ * (verified asset + matching arch), what is installed, and entries that say
+ * why they're unsupported. The header toggle shows the rest. */
+static gboolean g_show_incompat = FALSE;
+static gboolean app_installable(App* a) { return a->verified && app_compatible(a); }
+static gboolean app_unavailable(App* a) { return a->unavailable && *a->unavailable; }
+static gboolean app_visible(App* a) {
+    return g_show_incompat || app_installable(a) || app_installed(a) || app_unavailable(a);
+}
+static gboolean app_updatable(App* a) { return g_hash_table_contains(g_updates,a->id); }
+static const char* app_dlstate(App* a) { return g_hash_table_lookup(g_dlstate,a->id); }
+
+/* x86_64 if the app ships it, else its first arch */
+static char* primary_arch(App* a) {
+    char** v=g_strsplit(a->arch,"\n",-1);
+    char* out=NULL;
+    for (int i=0;v[i] && !out;i++) if (!strcmp(v[i],"x86_64")) out=g_strdup(v[i]);
+    if (!out) out=g_strdup(v[0]?v[0]:"another CPU");
+    g_strfreev(v); return out;
+}
+static char* arch_join(App* a,const char* sep,const char* last_sep) {
+    char** v=g_strsplit(a->arch,"\n",-1);
+    guint n=g_strv_length(v);
+    GString* s=g_string_new("");
+    for (guint i=0;i<n;i++) {
+        if (i) g_string_append(s, (i==n-1 && last_sep) ? last_sep : sep);
+        g_string_append(s,v[i]);
+    }
+    g_strfreev(v);
+    return g_string_free(s,FALSE);
+}
+
+static char* human_size(gint64 b) {
+    if (b <= 0) return g_strdup("");
+    if (b < 1024*1024) return g_strdup_printf("%.0f KB", b/1024.0);
+    if (b < 1024LL*1024*1024) return g_strdup_printf("%.1f MB", b/(1024.0*1024));
+    return g_strdup_printf("%.2f GB", b/(1024.0*1024*1024));
+}
+
+static void css(GtkWidget* w,const char* c){ gtk_style_context_add_class(gtk_widget_get_style_context(w),c); }
+static GtkWidget* lbl(const char* t,const char* c,gfloat x){
+    GtkWidget* l=gtk_label_new(t?t:"");
+    gtk_label_set_xalign(GTK_LABEL(l),x);
+    if(c)css(l,c); return l;
+}
+static GtkWidget* lbl_wrap(const char* t,const char* c,gfloat x,int width){
+    GtkWidget* l=lbl(t,c,x);
+    gtk_label_set_line_wrap(GTK_LABEL(l),TRUE);
+    gtk_label_set_line_wrap_mode(GTK_LABEL(l),PANGO_WRAP_WORD_CHAR);
+    if(width>0) gtk_label_set_max_width_chars(GTK_LABEL(l),width);
+    return l;
+}
+static GtkWidget* lbl_ell(const char* t,const char* c,gfloat x,int chars){
+    GtkWidget* l=lbl(t,c,x);
+    gtk_label_set_ellipsize(GTK_LABEL(l),PANGO_ELLIPSIZE_END);
+    gtk_label_set_max_width_chars(GTK_LABEL(l),chars);
+    return l;
+}
+
+/* ---- placeholder tile for apps without an icon: gradient + initial,
+ * colours picked from the id so they stay the same */
+static void rr_path(cairo_t* cr,double x,double y,double w,double h,double r){
+    cairo_new_sub_path(cr);
+    cairo_arc(cr,x+w-r,y+r,r,-G_PI/2,0); cairo_arc(cr,x+w-r,y+h-r,r,0,G_PI/2);
+    cairo_arc(cr,x+r,y+h-r,r,G_PI/2,G_PI); cairo_arc(cr,x+r,y+r,r,G_PI,3*G_PI/2);
+    cairo_close_path(cr);
+}
+typedef struct { double r,g,b; } RGB;
+static const RGB TILE_A[] = {
+    {0.929,0.424,0.878},{0.514,0.443,0.969},{0.180,0.486,0.965},{0.941,0.416,0.557},
+    {0.514,0.443,0.969},{0.180,0.486,0.965},{0.929,0.424,0.878},{0.110,0.106,0.141},
+};
+static const RGB TILE_B[] = {
+    {0.514,0.443,0.969},{0.180,0.486,0.965},{0.514,0.443,0.969},{0.514,0.443,0.969},
+    {0.929,0.424,0.878},{0.514,0.443,0.969},{0.180,0.486,0.965},{0.514,0.443,0.969},
+};
+static GdkPixbuf* gen_tile(const char* id,const char* name,int size){
+    guint h=0; for(const char* p=id;*p;p++) h=h*31+(guint)*p;
+    int k=h%G_N_ELEMENTS(TILE_A);
+    cairo_surface_t* s=cairo_image_surface_create(CAIRO_FORMAT_ARGB32,size,size);
+    cairo_t* cr=cairo_create(s);
+    cairo_pattern_t* pat=cairo_pattern_create_linear(0,0,size,size);
+    cairo_pattern_add_color_stop_rgb(pat,0,TILE_A[k].r,TILE_A[k].g,TILE_A[k].b);
+    cairo_pattern_add_color_stop_rgb(pat,1,TILE_B[k].r,TILE_B[k].g,TILE_B[k].b);
+    rr_path(cr,0,0,size,size,size*0.22);
+    cairo_set_source(cr,pat); cairo_fill(cr); cairo_pattern_destroy(pat);
+    char init[8]={0}; const char* p=name&&*name?name:id;
+    g_utf8_strncpy(init,p,1);
+    char* up=g_utf8_strup(init,-1);
+    cairo_select_font_face(cr,"Avenir Next",CAIRO_FONT_SLANT_NORMAL,CAIRO_FONT_WEIGHT_BOLD);
+    cairo_set_font_size(cr,size*0.5);
+    cairo_text_extents_t te; cairo_text_extents(cr,up,&te);
+    cairo_set_source_rgba(cr,1,1,1,0.95);
+    cairo_move_to(cr,(size-te.width)/2-te.x_bearing,(size-te.height)/2-te.y_bearing);
+    cairo_show_text(cr,up); g_free(up);
+    cairo_destroy(cr);
+    GdkPixbuf* pb=gdk_pixbuf_get_from_surface(s,0,0,size,size);
+    cairo_surface_destroy(s);
+    return pb;
+}
+/* icon: installed app's -> runtime cache -> bundled -> generated tile */
+static GdkPixbuf* app_icon(App* a,int size,gboolean* from_file){
+    char key[256]; snprintf(key,sizeof key,"%s@%d",a->id,size);
+    GdkPixbuf* pb=g_hash_table_lookup(g_iconcache,key);
+    if (pb) { if(from_file)*from_file=TRUE; return pb; }
+    /* a placeholder: not real, so the caller still queues the fetch */
+    pb=g_hash_table_lookup(g_tilecache,key);
+    if (pb) { if(from_file)*from_file=FALSE; return pb; }
+    char p[1024]; GdkPixbuf* out=NULL; gboolean real=FALSE;
+    /* installed app: xxri-app's icon, same as the dock and menu show */
+    snprintf(p,sizeof p,"/usr/local/share/pixmaps/xxri-app-%s.png",a->id);
+    out=load_png(p,size,size);
+    if (!out && g_cache) { snprintf(p,sizeof p,"%s/icons/%s.png",g_cache,a->id); out=load_png(p,size,size); }
+    if (!out) { snprintf(p,sizeof p,"%s/%s.png",ICON_DIR,a->id); out=load_png(p,size,size); }
+    if (out) real=TRUE; else out=gen_tile(a->id,a->name,size);
+    if (out) g_hash_table_replace(real?g_iconcache:g_tilecache,g_strdup(key),out);
+    if (from_file) *from_file=real;
+    return out;
+}
+static GtkWidget* icon_img(App* a,int size){
+    gboolean real=FALSE;
+    GdkPixbuf* pb=app_icon(a,size,&real);
+    GtkWidget* i=pb?gtk_image_new_from_pixbuf(pb):gtk_image_new();
+    css(i,"xxri-appicon");
+    gtk_widget_set_size_request(i,size,size);
+    /* no real icon yet: remember it, the fetcher may bring one in a moment */
+    if (!real && *a->icon_url && g_pending_icons) {
+        IconWant* w=g_new0(IconWant,1);
+        w->id=g_strdup(a->id); w->img=i; w->size=size;
+        g_object_ref(i);
+        g_ptr_array_add(g_pending_icons,w);
+    }
+    return i;
+}
+
+static void iconwant_free(gpointer p){ IconWant* w=p; g_free(w->id); if(w->img) g_object_unref(w->img); g_free(w); }
+static gboolean poll_icons(gpointer u){
+    static int tries=0;
+    if (!g_pending_icons || !g_pending_icons->len) { tries=0; g_icon_timer=0; return G_SOURCE_REMOVE; }
+    int landed=0;
+    for (guint i=0;i<g_pending_icons->len;) {
+        IconWant* w=g_pending_icons->pdata[i];
+        if (!GTK_IS_IMAGE(w->img)) { g_ptr_array_remove_index_fast(g_pending_icons,i); continue; }
+        char p[1024]; snprintf(p,sizeof p,"%s/icons/%s.png",g_cache,w->id);
+        if (g_file_test(p,G_FILE_TEST_EXISTS)) {
+            char key[256]; snprintf(key,sizeof key,"%s@%d",w->id,w->size);
+            g_hash_table_remove(g_iconcache,key);
+            g_hash_table_remove(g_tilecache,key);
+            GdkPixbuf* pb=load_png(p,w->size,w->size);
+            if (pb) {
+                gtk_image_set_from_pixbuf(GTK_IMAGE(w->img),pb);
+                g_hash_table_replace(g_iconcache,g_strdup(key),pb);
+                landed++;
+            }
+            g_ptr_array_remove_index_fast(g_pending_icons,i); continue;
+        }
+        i++;
+    }
+    /* the engine pulls four icons at a time, so a cold page can outlast the
+       old 40 polls and leave placeholders until the page gets rebuilt */
+    if (landed) tries = 0;
+    if (++tries > 240) { tries=0; g_icon_timer=0; return G_SOURCE_REMOVE; }
+    return G_SOURCE_CONTINUE;
+}
+/* ask the engine to cache the icons this page wants (one batched call) */
+/* an icon the engine could not fetch is asked for again after 5 minutes at
+ * the earliest (cleared with a new catalog and by Refresh) */
+#define ICON_RETRY_S 300
+static void kick_icon_fetch(void){
+    if (!g_online || !g_pending_icons || !g_pending_icons->len) return;
+    if (!g_icon_tried) g_icon_tried=g_hash_table_new_full(g_str_hash,g_str_equal,g_free,NULL);
+    guint now=(guint)(g_get_monotonic_time()/G_USEC_PER_SEC);
+    GString* cmd=g_string_new("xxri-store icons");
+    GHashTable* seen=g_hash_table_new(g_str_hash,g_str_equal);
+    int n=0;
+    for (guint i=0;i<g_pending_icons->len && n<48;i++) {
+        IconWant* w=g_pending_icons->pdata[i];
+        if (g_hash_table_contains(seen,w->id)) continue;
+        g_hash_table_add(seen,w->id);
+        gpointer t=g_hash_table_lookup(g_icon_tried,w->id);
+        if (t && now-GPOINTER_TO_UINT(t)<ICON_RETRY_S) continue;
+        g_hash_table_replace(g_icon_tried,g_strdup(w->id),GUINT_TO_POINTER(now?now:1));
+        g_string_append_printf(cmd," %s",w->id); n++;
+    }
+    g_hash_table_destroy(seen);
+    if (n) run_bg("%s",cmd->str);
+    /* the poller serves whatever the current page waits for, however it got fetched */
+    if (!g_icon_timer) g_icon_timer=g_timeout_add(1500,poll_icons,NULL);
+    g_string_free(cmd,TRUE);
+}
+
+static void act_install(GtkWidget* w,gpointer p){ App* a=p; (void)w;
+    gtrace("act_install ENTER  ptr=%p", (void*)a);
+    if (!a) { gtrace("act_install ABORT: NULL app pointer"); return; }
+    gtrace("act_install app id='%s' name='%s' kind='%s' verified=%d",
+           a->id?a->id:"(null)", a->name?a->name:"(null)",
+           a->kind?a->kind:"(null)", a->verified);
+    if (!a->id || !*a->id) { gtrace("act_install ABORT: empty id -> backend would get no argument"); return; }
+    run_bg("xxri-store install %s",a->id);
+    gtrace("act_install -> open_page(downloads)");
+    open_page("downloads");
+    gtrace("act_install DONE");
+}
+static void act_launch(GtkWidget* w,gpointer p){ App* a=p; (void)w;
+    const char* rid=installed_id(a);
+    if (rid) run_bg("xxri-app launch %s",rid);
+}
+static void act_remove(GtkWidget* w,gpointer p){ App* a=p; (void)w;
+    const char* rid=installed_id(a);
+    if (!rid) return;
+    GtkWidget* d=gtk_message_dialog_new(GTK_WINDOW(g_win),GTK_DIALOG_MODAL,
+        GTK_MESSAGE_QUESTION,GTK_BUTTONS_NONE,
+        _("Remove %s?"),a->name);
+    gtk_message_dialog_format_secondary_text(GTK_MESSAGE_DIALOG(d),
+        _("The app will be removed from the dock and the menu, and its package file will be deleted."));
+    gtk_dialog_add_button(GTK_DIALOG(d),_("Cancel"),GTK_RESPONSE_CANCEL);
+    GtkWidget* rb=gtk_dialog_add_button(GTK_DIALOG(d),_("Remove"),GTK_RESPONSE_ACCEPT);
+    css(rb,"destructive-action");
+    int r=gtk_dialog_run(GTK_DIALOG(d));
+    gtk_widget_destroy(d);
+    if (r!=GTK_RESPONSE_ACCEPT) return;
+    char* out=run_cmd("xxri-app remove %s --purge",rid); g_free(out);
+    refresh_state();
+    rebuild(g_page);
+}
+static void act_update(GtkWidget* w,gpointer p){ App* a=p; (void)w;
+    run_bg("xxri-store install %s",a->id);
+    open_page("downloads");
+}
+/* by catalog id, for an installed app missing from the loaded catalog */
+static void act_update_id(GtkWidget* w,gpointer p){ (void)p;
+    const char* cid=g_object_get_data(G_OBJECT(w),"cid");
+    if (cid && *cid) { run_bg("xxri-store install %s",cid); open_page("downloads"); }
+}
+static void act_website(GtkWidget* w,gpointer p){ App* a=p; (void)w;
+    if (*a->homepage) run_bg("xxri-open-url '%s'",a->homepage);
+}
+
+/* disk needed in KB: archives unpack bigger, a tcz pulls in deps.
+   Keep in sync with space_needed() in xxri-store */
+static gint64 app_space_kb(App* a){
+    gint64 sz = a->size > 0 ? a->size : (gint64)32*1024*1024;
+    int mult = 2;
+    if (a->kind && !strcmp(a->kind,"tcz"))          mult = 5;
+    else if (a->kind && !strcmp(a->kind,"archive")) mult = 4;
+    return (sz/1024)*mult + 51200;   /* +50 MB headroom */
+}
+static gboolean app_has_room(App* a){
+    return g_free_kb <= 0 || app_space_kb(a) <= g_free_kb;
+}
+
+/* the one button that says what this app needs right now */
+static GtkWidget* action_button(App* a,gboolean big){
+    const char* st=app_dlstate(a);
+    if (st && (!strcmp(st,"downloading")||!strcmp(st,"queued")||!strcmp(st,"installing")
+               ||!strcmp(st,"verifying")||!strcmp(st,"resolving")||!strcmp(st,"dependencies"))) {
+        GtkWidget* b=gtk_button_new_with_label(!strcmp(st,"queued")?_("Queued"):_("Installing\xe2\x80\xa6"));
+        gtk_widget_set_sensitive(b,FALSE); css(b,"xxri-chip");
+        if(big)css(b,"xxri-bigbtn");
+        return b;
+    }
+    if (app_updatable(a)) {
+        GtkWidget* b=gtk_button_new_with_label(_("Update"));
+        css(b,"xxri-accent"); if(big)css(b,"xxri-bigbtn");
+        g_signal_connect(b,"clicked",G_CALLBACK(act_update),a);
+        return b;
+    }
+    if (app_installed(a)) {
+        GtkWidget* b=gtk_button_new_with_label(_("Open"));
+        css(b,"xxri-accent"); if(big)css(b,"xxri-bigbtn");
+        g_signal_connect(b,"clicked",G_CALLBACK(act_launch),a);
+        return b;
+    }
+    if (app_unavailable(a)) {
+        GtkWidget* b=gtk_button_new_with_label(big ? _("Currently unsupported") : _("Unsupported"));
+        gtk_widget_set_sensitive(b,FALSE); css(b,"xxri-chip");
+        gtk_widget_set_tooltip_text(b,a->unavailable);
+        if(big)css(b,"xxri-bigbtn");
+        return b;
+    }
+    if (app_compatible(a) && !a->verified) {
+        /* metadata-only entry: no confirmed asset, so never offer a dead Install */
+        GtkWidget* b=gtk_button_new_with_label(_("Unavailable"));
+        gtk_widget_set_sensitive(b,FALSE); css(b,"xxri-chip");
+        gtk_widget_set_tooltip_text(b,_("No downloadable release was found for this architecture"));
+        if(big)css(b,"xxri-bigbtn");
+        return b;
+    }
+    if (!app_compatible(a)) {
+        gboolean lite32 = !strcmp(g_arch,"i686");
+        GtkWidget* b=gtk_button_new_with_label(lite32 ? (big ? _("Available for XXRI Regular / Pro")
+                                                             : _("Regular / Pro"))
+                                                      : (big ? _("Built for another architecture")
+                                                             : _("Other architecture")));
+        gtk_widget_set_sensitive(b,FALSE); css(b,"xxri-chip");
+        char* pa=primary_arch(a);
+        char tip[160];
+        if (lite32) snprintf(tip,sizeof tip,
+            _("This app ships a %s build. XXRI Lite is 32-bit (i686); "
+            "XXRI Regular and Pro can install it."), pa);
+        else snprintf(tip,sizeof tip,
+            _("This app ships a %s build, but this device runs %s."), pa, g_arch);
+        g_free(pa);
+        gtk_widget_set_tooltip_text(b,tip);
+        if(big)css(b,"xxri-bigbtn");
+        return b;
+    }
+    if (!app_has_room(a)) {
+        /* would fail half way in the unpacker, looking like "Install does nothing" */
+        GtkWidget* b=gtk_button_new_with_label(big ? _("Not enough disk space") : _("No space"));
+        gtk_widget_set_sensitive(b,FALSE); css(b,"xxri-chip");
+        char tip[192]; snprintf(tip,sizeof tip,
+            _("%s needs about %lld MB but only %lld MB is free. "
+            "Remove an application you no longer need, then try again."),
+            a->name, (long long)(app_space_kb(a)/1024), (long long)(g_free_kb/1024));
+        gtk_widget_set_tooltip_text(b,tip);
+        if(big)css(b,"xxri-bigbtn");
+        return b;
+    }
+    GtkWidget* b=gtk_button_new_with_label(_("Install"));
+    css(b,"xxri-accent"); if(big)css(b,"xxri-bigbtn");
+    gulong h=g_signal_connect(b,"clicked",G_CALLBACK(act_install),a);
+    gtrace("action_button INSTALL built for '%s' handler=%lu data=%p", a->id, h, (void*)a);
+    return b;
+}
+/* the small round download glyph used on the mockup's tiles */
+static gboolean draw_dl_glyph(GtkWidget* w,cairo_t* cr,gpointer u){
+    App* a=u;
+    GtkAllocation al; gtk_widget_get_allocation(w,&al);
+    double S=al.width<al.height?al.width:al.height, cx=al.width/2.0, cy=al.height/2.0;
+    gboolean inst=app_installed(a), upd=app_updatable(a), ok=app_compatible(a);
+    const char* st=app_dlstate(a);
+    gboolean busy = st && (!strcmp(st,"downloading")||!strcmp(st,"queued")||!strcmp(st,"installing")||!strcmp(st,"dependencies"));
+    if (upd || (!inst && ok && !busy)) {
+        cairo_pattern_t* p=cairo_pattern_create_linear(0,0,al.width,al.height);
+        /* the primary action: dark blue to light blue, as every primary button */
+        cairo_pattern_add_color_stop_rgb(p,0,0.118,0.310,0.761);
+        cairo_pattern_add_color_stop_rgb(p,1,0.290,0.604,0.961);
+        cairo_set_source(cr,p); cairo_arc(cr,cx,cy,S/2-1,0,2*G_PI); cairo_fill(cr);
+        cairo_pattern_destroy(p);
+        cairo_set_source_rgb(cr,1,1,1); cairo_set_line_width(cr,1.8);
+        cairo_move_to(cr,cx,cy-S*0.20); cairo_line_to(cr,cx,cy+S*0.16); cairo_stroke(cr);
+        cairo_move_to(cr,cx-S*0.13,cy+0.02*S); cairo_line_to(cr,cx,cy+S*0.17);
+        cairo_line_to(cr,cx+S*0.13,cy+0.02*S); cairo_stroke(cr);
+    } else if (inst) {
+        cairo_set_source_rgba(cr,0.204,0.780,0.349,0.16); cairo_arc(cr,cx,cy,S/2-1,0,2*G_PI); cairo_fill(cr);
+        cairo_set_source_rgb(cr,0.118,0.620,0.275); cairo_set_line_width(cr,2);
+        cairo_move_to(cr,cx-S*0.16,cy); cairo_line_to(cr,cx-S*0.04,cy+S*0.13);
+        cairo_line_to(cr,cx+S*0.17,cy-S*0.15); cairo_stroke(cr);
+    } else if (busy) {
+        cairo_set_source_rgba(cr,0.180,0.486,0.965,0.14); cairo_arc(cr,cx,cy,S/2-1,0,2*G_PI); cairo_fill(cr);
+        cairo_set_source_rgb(cr,0.180,0.486,0.965); cairo_set_line_width(cr,2);
+        cairo_arc(cr,cx,cy,S*0.22,-G_PI/2,G_PI); cairo_stroke(cr);
+    } else {
+        if (xxri_theme_dark()) cairo_set_source_rgba(cr,1,1,1,0.08);
+        else cairo_set_source_rgba(cr,0,0,0,0.06);
+        cairo_arc(cr,cx,cy,S/2-1,0,2*G_PI); cairo_fill(cr);
+        cairo_set_source_rgba(cr,0.42,0.42,0.45,0.9); cairo_set_line_width(cr,1.6);
+        cairo_move_to(cr,cx-S*0.12,cy); cairo_line_to(cr,cx+S*0.12,cy); cairo_stroke(cr);
+    }
+    return FALSE;
+}
+static gboolean on_dl_click(GtkWidget* w,GdkEventButton* e,gpointer u){ (void)w;(void)e;
+    App* a=u;
+    if (app_updatable(a)) { act_update(NULL,a); return TRUE; }
+    if (app_installed(a)) { act_launch(NULL,a); return TRUE; }
+    if (!app_compatible(a)) return TRUE;
+    act_install(NULL,a); return TRUE;
+}
+static GtkWidget* dl_glyph(App* a,int size){
+    GtkWidget* da=gtk_drawing_area_new();
+    gtk_widget_set_size_request(da,size,size);
+    gtk_widget_add_events(da,GDK_BUTTON_PRESS_MASK);
+    g_signal_connect(da,"draw",G_CALLBACK(draw_dl_glyph),a);
+    GtkWidget* ev=gtk_event_box_new();
+    gtk_event_box_set_visible_window(GTK_EVENT_BOX(ev),FALSE);
+    gtk_container_add(GTK_CONTAINER(ev),da);
+    g_signal_connect(ev,"button-press-event",G_CALLBACK(on_dl_click),a);
+    gtk_widget_set_halign(ev,GTK_ALIGN_CENTER);
+    return ev;
+}
+
+static void show_app(App* a);
+static gboolean on_tile_click(GtkWidget* w,GdkEventButton* e,gpointer u){ (void)w;(void)e; show_app((App*)u); return FALSE; }
+
+/* the vertical tile from the mockup: icon, two-line name, download glyph */
+static GtkWidget* app_tile(App* a){
+    GtkWidget* t=gtk_box_new(GTK_ORIENTATION_VERTICAL,6);
+    css(t,"xxri-tile");
+    gtk_widget_set_size_request(t,104,-1);
+    gtk_widget_set_valign(t,GTK_ALIGN_START);   /* natural height, not rail height */
+    GtkWidget* ic=icon_img(a,60);
+    gtk_widget_set_halign(ic,GTK_ALIGN_CENTER);
+    GtkWidget* iev=gtk_event_box_new();
+    gtk_event_box_set_visible_window(GTK_EVENT_BOX(iev),FALSE);
+    gtk_container_add(GTK_CONTAINER(iev),ic);
+    g_signal_connect(iev,"button-press-event",G_CALLBACK(on_tile_click),a);
+    gtk_box_pack_start(GTK_BOX(t),iev,FALSE,FALSE,0);
+    GtkWidget* nm=lbl_wrap(a->name,"xxri-tile-name",0.5,12);
+    gtk_label_set_justify(GTK_LABEL(nm),GTK_JUSTIFY_CENTER);
+    gtk_label_set_lines(GTK_LABEL(nm),2);
+    gtk_label_set_ellipsize(GTK_LABEL(nm),PANGO_ELLIPSIZE_END);
+    GtkWidget* nev=gtk_event_box_new();
+    gtk_event_box_set_visible_window(GTK_EVENT_BOX(nev),FALSE);
+    gtk_container_add(GTK_CONTAINER(nev),nm);
+    g_signal_connect(nev,"button-press-event",G_CALLBACK(on_tile_click),a);
+    gtk_box_pack_start(GTK_BOX(t),nev,FALSE,FALSE,0);
+    gtk_box_pack_start(GTK_BOX(t),dl_glyph(a,30),FALSE,FALSE,0);
+    return t;
+}
+
+/* the wide card used by category / search / list pages */
+static GtkWidget* app_card(App* a){
+    GtkWidget* c=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,12);
+    css(c,"xxri-appcard");
+    GtkWidget* ic=icon_img(a,52); gtk_widget_set_valign(ic,GTK_ALIGN_CENTER);
+    gtk_box_pack_start(GTK_BOX(c),ic,FALSE,FALSE,0);
+    GtkWidget* tv=gtk_box_new(GTK_ORIENTATION_VERTICAL,2);
+    gtk_widget_set_valign(tv,GTK_ALIGN_CENTER);
+    GtkWidget* nb=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,6);
+    gtk_box_pack_start(GTK_BOX(nb),lbl_ell(a->name,"xxri-app-name",0,22),FALSE,FALSE,0);
+    if (app_updatable(a)) {
+        GtkWidget* b=lbl(_("Update"),"xxri-badge",0.5); gtk_widget_set_valign(b,GTK_ALIGN_CENTER);
+        gtk_box_pack_start(GTK_BOX(nb),b,FALSE,FALSE,0);
+    } else if (app_installed(a)) {
+        GtkWidget* b=lbl(_("Installed"),"xxri-badge ok",0.5); gtk_widget_set_valign(b,GTK_ALIGN_CENTER);
+        gtk_box_pack_start(GTK_BOX(nb),b,FALSE,FALSE,0);
+    } else if (!app_compatible(a)) {
+        GtkWidget* b=lbl(_("Regular / Pro"),"xxri-badge warn",0.5);
+        gtk_widget_set_valign(b,GTK_ALIGN_CENTER);
+        char* f=arch_join(a,"/",NULL);
+        gtk_widget_set_tooltip_text(b,f); g_free(f);
+        gtk_box_pack_start(GTK_BOX(nb),b,FALSE,FALSE,0);
+    }
+    gtk_box_pack_start(GTK_BOX(tv),nb,FALSE,FALSE,0);
+    gtk_box_pack_start(GTK_BOX(tv),lbl_ell(a->summary,"xxri-app-summary",0,52),FALSE,FALSE,0);
+    char sub[192]; char* hs=human_size(a->size);
+    { const char* parts[3]; int n=0;
+      const char* cat=cat_title(a->category);
+      if (a->developer && *a->developer) parts[n++]=a->developer;
+      if (cat && *cat)                   parts[n++]=cat;
+      if (hs && *hs)                     parts[n++]=hs;
+      sub[0]=0;
+      for (int i=0;i<n;i++) {
+          if (i) g_strlcat(sub," \xc2\xb7 ",sizeof sub);
+          g_strlcat(sub,parts[i],sizeof sub);
+      }
+    }
+    g_free(hs);
+    gtk_box_pack_start(GTK_BOX(tv),lbl_ell(sub,"xxri-app-dev",0,52),FALSE,FALSE,0);
+    gtk_box_pack_start(GTK_BOX(c),tv,TRUE,TRUE,0);
+    GtkWidget* act=action_button(a,FALSE); gtk_widget_set_valign(act,GTK_ALIGN_CENTER);
+    gtk_box_pack_end(GTK_BOX(c),act,FALSE,FALSE,0);
+    GtkWidget* ev=gtk_event_box_new();
+    gtk_event_box_set_visible_window(GTK_EVENT_BOX(ev),FALSE);
+    gtk_container_add(GTK_CONTAINER(ev),c);
+    g_signal_connect(ev,"button-press-event",G_CALLBACK(on_tile_click),a);
+    return ev;
+}
+
+/* Never build 950 cards.  Add a chunk, then more as the user reaches the end. */
+typedef struct { GPtrArray* apps; guint shown; GtkWidget* box; GtkWidget* more; } LazyGrid;
+/* The grid on the page now. The scrolled window outlives its grid (every
+ * keystroke in the search box rebuilds the results), so on_edge looks the
+ * live one up here and lazy_free clears the slot before the grid goes. */
+static LazyGrid* g_lazy_live;
+static void lazy_free(gpointer p,GClosure* c){ (void)c; LazyGrid* g=p;
+    if (g_lazy_live==g) g_lazy_live=NULL;
+    g_ptr_array_free(g->apps,TRUE); g_free(g); }
+static void lazy_add(LazyGrid* g,guint n){
+    guint end=g->shown+n; if(end>g->apps->len) end=g->apps->len;
+    for (guint i=g->shown;i<end;i++)
+        gtk_box_pack_start(GTK_BOX(g->box),app_card(g->apps->pdata[i]),FALSE,FALSE,0);
+    g->shown=end;
+    gtk_widget_show_all(g->box);
+    /* no_show_all was set on `more`, so this is the authority on its visibility */
+    if (g->more) gtk_widget_set_visible(g->more,g->shown<g->apps->len);
+    kick_icon_fetch();
+}
+static void on_more(GtkWidget* w,gpointer p){ (void)w; lazy_add((LazyGrid*)p,24); }
+static void on_edge(GtkScrolledWindow* sw,GtkPositionType pos,gpointer p){ (void)sw;(void)p;
+    if (pos==GTK_POS_BOTTOM && g_lazy_live) lazy_add(g_lazy_live,24);
+}
+static GtkWidget* lazy_grid(GPtrArray* apps){
+    LazyGrid* g=g_new0(LazyGrid,1);
+    g->apps=apps; g->shown=0;
+    GtkWidget* box=gtk_box_new(GTK_ORIENTATION_VERTICAL,8);
+    g->box=box;
+    GtkWidget* wrap=gtk_box_new(GTK_ORIENTATION_VERTICAL,10);
+    gtk_box_pack_start(GTK_BOX(wrap),box,FALSE,FALSE,0);
+    GtkWidget* more=gtk_button_new_with_label(_("Show more"));
+    css(more,"xxri-chip");
+    gtk_widget_set_halign(more,GTK_ALIGN_CENTER);
+    gtk_widget_set_no_show_all(more,TRUE);   /* lazy_add controls its visibility */
+    g->more=more;
+    g_signal_connect_data(more,"clicked",G_CALLBACK(on_more),g,lazy_free,0);
+    gtk_box_pack_start(GTK_BOX(wrap),more,FALSE,FALSE,0);
+    g_object_set_data(G_OBJECT(wrap),"lazy",g);
+    g_lazy_live=g;
+    lazy_add(g,24);
+    return wrap;
+}
+
+static void on_seeall(GtkWidget* w,gpointer p){ (void)w; open_page((char*)p); }
+/* rails have no scrollbar, so fade the cut-off edge to show there's more */
+static gboolean rail_fade_draw(GtkWidget* w, cairo_t* cr, gpointer d){
+    (void)d;
+    GtkAdjustment* adj = gtk_scrolled_window_get_hadjustment(GTK_SCROLLED_WINDOW(w));
+    if (!adj) return FALSE;
+    double lo = gtk_adjustment_get_value(adj);
+    double page = gtk_adjustment_get_page_size(adj);
+    double upper = gtk_adjustment_get_upper(adj);
+    int ww = gtk_widget_get_allocated_width(w);
+    int wh = gtk_widget_get_allocated_height(w);
+    const double FADE = 34.0;
+    /* the page background the rails sit on: @xxri_surface (dark: #242124) */
+    const gboolean dk = xxri_theme_dark();
+    const double R = dk ? 0.141 : 1.0, G = dk ? 0.129 : 1.0, B = dk ? 0.141 : 1.0;
+    if (upper - (lo + page) > 1.0) {            /* something is off the right */
+        cairo_pattern_t* p = cairo_pattern_create_linear(ww - FADE, 0, ww, 0);
+        cairo_pattern_add_color_stop_rgba(p, 0.0, R, G, B, 0.0);
+        cairo_pattern_add_color_stop_rgba(p, 1.0, R, G, B, 1.0);
+        cairo_set_source(cr, p);
+        cairo_rectangle(cr, ww - FADE, 0, FADE, wh);
+        cairo_fill(cr);
+        cairo_pattern_destroy(p);
+    }
+    if (lo > 1.0) {                              /* and to the left once scrolled */
+        cairo_pattern_t* p = cairo_pattern_create_linear(FADE, 0, 0, 0);
+        cairo_pattern_add_color_stop_rgba(p, 0.0, R, G, B, 0.0);
+        cairo_pattern_add_color_stop_rgba(p, 1.0, R, G, B, 1.0);
+        cairo_set_source(cr, p);
+        cairo_rectangle(cr, 0, 0, FADE, wh);
+        cairo_fill(cr);
+        cairo_pattern_destroy(p);
+    }
+    return FALSE;
+}
+
+/* a horizontal row of tiles, like the mockup's "Recomended apps" */
+static void section_rail(GtkWidget* box,const char* title,GPtrArray* apps,const char* seeall){
+    if (!apps || !apps->len) return;
+    GtkWidget* hdr=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,8);
+    gtk_widget_set_margin_top(hdr,16);
+    gtk_box_pack_start(GTK_BOX(hdr),lbl(title,"xxri-section",0),TRUE,TRUE,0);
+    if (seeall) {
+        GtkWidget* b=gtk_button_new_with_label(_("See all"));
+        css(b,"xxri-linkbtn");
+        g_signal_connect_data(b,"clicked",G_CALLBACK(on_seeall),g_strdup(seeall),(GClosureNotify)g_free,0);
+        gtk_box_pack_end(GTK_BOX(hdr),b,FALSE,FALSE,0);
+    }
+    gtk_box_pack_start(GTK_BOX(box),hdr,FALSE,FALSE,0);
+    GtkWidget* sc=gtk_scrolled_window_new(NULL,NULL);
+    /* EXTERNAL: no scroll strip under every rail (the mockup has none);
+       wheel and drag still scroll */
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sc),GTK_POLICY_EXTERNAL,GTK_POLICY_NEVER);
+    gtk_scrolled_window_set_overlay_scrolling(GTK_SCROLLED_WINDOW(sc),TRUE);
+    /* after the children, so the fade lies on top of the cards */
+    g_signal_connect_after(sc,"draw",G_CALLBACK(rail_fade_draw),NULL);
+    css(sc,"xxri-rail");
+    GtkWidget* row=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,10);
+    int shown=0;
+    for (guint i=0;i<apps->len && shown<12;i++){
+        App* a=apps->pdata[i];
+        if (!app_visible(a)) continue;            /* hide incompatible in rails too */
+        gtk_box_pack_start(GTK_BOX(row),app_tile(a),FALSE,FALSE,0); shown++;
+    }
+    gtk_container_add(GTK_CONTAINER(sc),row);
+    gtk_widget_set_size_request(sc,-1,158);
+    if (shown) gtk_box_pack_start(GTK_BOX(box),sc,FALSE,FALSE,0);
+    else { gtk_widget_destroy(sc); gtk_widget_destroy(hdr); }
+}
+
+static GPtrArray* apps_in_cat(const char* cat){
+    GPtrArray* r=g_ptr_array_new();
+    for (guint i=0;i<g_apps->len;i++){ App* a=g_apps->pdata[i];
+        if(!strcmp(a->category,cat) && app_visible(a)) g_ptr_array_add(r,a); }
+    return r;
+}
+static GPtrArray* sect(const char* k){ return g_sections?g_hash_table_lookup(g_sections,k):NULL; }
+static GPtrArray* apps_installed_list(void){
+    GPtrArray* r=g_ptr_array_new();
+    for (guint i=0;i<g_apps->len;i++){ App* a=g_apps->pdata[i]; if(app_installed(a)) g_ptr_array_add(r,a); }
+    return r;
+}
+static GPtrArray* apps_updatable_list(void){
+    GPtrArray* r=g_ptr_array_new();
+    for (guint i=0;i<g_apps->len;i++){ App* a=g_apps->pdata[i]; if(app_updatable(a)) g_ptr_array_add(r,a); }
+    return r;
+}
+/* downloads that stopped half way - the mockup's "Continue installing" */
+static GPtrArray* apps_continue(void){
+    GPtrArray* r=g_ptr_array_new();
+    GHashTableIter it; gpointer k,v;
+    if (!g_dlstate) return r;
+    g_hash_table_iter_init(&it,g_dlstate);
+    while (g_hash_table_iter_next(&it,&k,&v)) {
+        if (strcmp(v,"paused") && strcmp(v,"failed") && strcmp(v,"queued")) continue;
+        App* a=g_hash_table_lookup(g_byid,k);
+        if (a) g_ptr_array_add(r,a);
+    }
+    return r;
+}
+
+static gboolean draw_hero(GtkWidget* w,cairo_t* cr,gpointer u){
+    guint h=GPOINTER_TO_UINT(u);
+    GtkAllocation al; gtk_widget_get_allocation(w,&al);
+    cairo_pattern_t* p=cairo_pattern_create_linear(0,0,al.width,al.height);
+    /* three brand ramps, chosen per banner */
+    if (h%3==0) { cairo_pattern_add_color_stop_rgb(p,0,0.110,0.110,0.118);
+                  cairo_pattern_add_color_stop_rgb(p,1,0.227,0.251,0.318); }
+    else if (h%3==1) { cairo_pattern_add_color_stop_rgb(p,0,0.929,0.424,0.878);
+                       cairo_pattern_add_color_stop_rgb(p,1,0.180,0.486,0.965); }
+    else { cairo_pattern_add_color_stop_rgb(p,0,0.180,0.486,0.965);
+           cairo_pattern_add_color_stop_rgb(p,1,0.514,0.443,0.969); }
+    rr_path(cr,0,0,al.width,al.height,18);
+    cairo_set_source(cr,p); cairo_fill(cr);
+    cairo_pattern_destroy(p);
+    /* a soft light bloom, like the xxri wallpaper */
+    cairo_pattern_t* g2=cairo_pattern_create_radial(al.width*0.82,al.height*0.15,4,
+                                                    al.width*0.82,al.height*0.15,al.width*0.6);
+    cairo_pattern_add_color_stop_rgba(g2,0,1,1,1,0.22);
+    cairo_pattern_add_color_stop_rgba(g2,1,1,1,1,0);
+    rr_path(cr,0,0,al.width,al.height,18);
+    cairo_set_source(cr,g2); cairo_fill(cr); cairo_pattern_destroy(g2);
+    return FALSE;
+}
+static GtkWidget* hero_banner(App* a,guint idx){
+    GtkWidget* ov=gtk_overlay_new();
+    GtkWidget* da=gtk_drawing_area_new();
+    gtk_widget_set_size_request(da,376,150);
+    g_signal_connect(da,"draw",G_CALLBACK(draw_hero),GUINT_TO_POINTER(idx));
+    gtk_container_add(GTK_CONTAINER(ov),da);
+    GtkWidget* in=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,14);
+    css(in,"xxri-hero-in");
+    gtk_box_pack_start(GTK_BOX(in),icon_img(a,64),FALSE,FALSE,0);
+    GtkWidget* tv=gtk_box_new(GTK_ORIENTATION_VERTICAL,3);
+    gtk_widget_set_valign(tv,GTK_ALIGN_CENTER);
+    gtk_box_pack_start(GTK_BOX(tv),lbl(idx==0?_("Editor's choice"):_("Featured"),"xxri-hero-kicker",0),FALSE,FALSE,0);
+    gtk_box_pack_start(GTK_BOX(tv),lbl_ell(a->name,"xxri-hero-title",0,18),FALSE,FALSE,0);
+    GtkWidget* s=lbl_wrap(a->summary,"xxri-hero-sub",0,30);
+    gtk_label_set_lines(GTK_LABEL(s),2);
+    gtk_label_set_ellipsize(GTK_LABEL(s),PANGO_ELLIPSIZE_END);
+    gtk_box_pack_start(GTK_BOX(tv),s,FALSE,FALSE,0);
+    GtkWidget* ab=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,0);
+    GtkWidget* act=action_button(a,FALSE);
+    css(act,"xxri-hero-btn");
+    gtk_box_pack_start(GTK_BOX(ab),act,FALSE,FALSE,0);
+    gtk_widget_set_margin_top(ab,4);
+    gtk_box_pack_start(GTK_BOX(tv),ab,FALSE,FALSE,0);
+    gtk_box_pack_start(GTK_BOX(in),tv,TRUE,TRUE,0);
+    gtk_overlay_add_overlay(GTK_OVERLAY(ov),in);
+    GtkWidget* ev=gtk_event_box_new();
+    gtk_event_box_set_visible_window(GTK_EVENT_BOX(ev),FALSE);
+    gtk_container_add(GTK_CONTAINER(ev),ov);
+    return ev;
+}
+
+static void build_home(GtkWidget* box){
+    /* hero rail - respects the hide-incompatible filter like every other rail */
+    GPtrArray* feat=sect("featured");
+    if (feat && feat->len) {
+        GtkWidget* sc=gtk_scrolled_window_new(NULL,NULL);
+        gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sc),GTK_POLICY_EXTERNAL,GTK_POLICY_NEVER);
+        gtk_scrolled_window_set_overlay_scrolling(GTK_SCROLLED_WINDOW(sc),TRUE);
+        g_signal_connect_after(sc,"draw",G_CALLBACK(rail_fade_draw),NULL);
+        css(sc,"xxri-rail");
+        GtkWidget* row=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,12);
+        int shown=0;
+        for (guint i=0;i<feat->len && shown<4;i++){
+            App* a=feat->pdata[i];
+            if (!app_visible(a)) continue;
+            gtk_box_pack_start(GTK_BOX(row),hero_banner(a,shown),FALSE,FALSE,0); shown++;
+        }
+        gtk_container_add(GTK_CONTAINER(sc),row);
+        gtk_widget_set_size_request(sc,-1,162);
+        if (shown) gtk_box_pack_start(GTK_BOX(box),sc,FALSE,FALSE,0); else gtk_widget_destroy(sc);
+    }
+    /* state rails first: what the user is in the middle of */
+    GPtrArray* cont=apps_continue();
+    if (cont->len) section_rail(box,_("Continue installing"),cont,"downloads"); else g_ptr_array_free(cont,TRUE);
+    GPtrArray* upd=apps_updatable_list();
+    if (upd->len) section_rail(box,_("Updates available"),upd,"updates"); else g_ptr_array_free(upd,TRUE);
+
+    section_rail(box,_("Recommended for you"),sect("recommended"),"cat:all");
+    section_rail(box,_("Trending"),sect("trending"),"cat:all");
+    section_rail(box,_("Editor's choice"),sect("editors"),"cat:all");
+    section_rail(box,_("Newest releases"),sect("newest"),"cat:all");
+    section_rail(box,_("Recently updated"),sect("updated"),"cat:all");
+
+    GPtrArray* inst=apps_installed_list();
+    if (inst->len) section_rail(box,_("Your apps"),inst,"installed"); else g_ptr_array_free(inst,TRUE);
+
+    /* popular categories */
+    GtkWidget* hdr=lbl(_("Popular categories"),"xxri-section",0);
+    gtk_widget_set_margin_top(hdr,16);
+    gtk_box_pack_start(GTK_BOX(box),hdr,FALSE,FALSE,0);
+    GtkWidget* fb=gtk_flow_box_new();
+    gtk_flow_box_set_selection_mode(GTK_FLOW_BOX(fb),GTK_SELECTION_NONE);
+    gtk_flow_box_set_max_children_per_line(GTK_FLOW_BOX(fb),4);
+    gtk_flow_box_set_row_spacing(GTK_FLOW_BOX(fb),8);
+    gtk_flow_box_set_column_spacing(GTK_FLOW_BOX(fb),8);
+    gtk_flow_box_set_homogeneous(GTK_FLOW_BOX(fb),TRUE);
+    const char* pop[]={"browser","office","development","graphics","video","audio","games","ai",NULL};
+    for (int i=0;pop[i];i++) {
+        GPtrArray* ap=apps_in_cat(pop[i]); int cnt=ap->len; g_ptr_array_free(ap,TRUE);
+        if (!cnt) continue;
+        GtkWidget* t=gtk_box_new(GTK_ORIENTATION_VERTICAL,2); css(t,"xxri-cat-tile");
+        gtk_box_pack_start(GTK_BOX(t),lbl(cat_title(pop[i]),"xxri-cat-name",0),FALSE,FALSE,0);
+        char c[64]; snprintf(c,sizeof c,ngettext("%d app","%d apps",cnt),cnt);
+        gtk_box_pack_start(GTK_BOX(t),lbl(c,"xxri-cat-count",0),FALSE,FALSE,0);
+        GtkWidget* ev=gtk_event_box_new();
+        gtk_event_box_set_visible_window(GTK_EVENT_BOX(ev),FALSE);
+        gtk_container_add(GTK_CONTAINER(ev),t);
+        char pg[64]; snprintf(pg,sizeof pg,"cat:%s",pop[i]);
+        g_signal_connect_data(ev,"button-press-event",G_CALLBACK(on_seeall),g_strdup(pg),(GClosureNotify)g_free,0);
+        gtk_flow_box_insert(GTK_FLOW_BOX(fb),ev,-1);
+    }
+    gtk_box_pack_start(GTK_BOX(box),fb,FALSE,FALSE,0);
+}
+
+static void build_categories(GtkWidget* box){
+    gtk_box_pack_start(GTK_BOX(box),lbl(_("Categories"),"xxri-page-title",0),FALSE,FALSE,0);
+    gtk_box_pack_start(GTK_BOX(box),lbl(_("Every app in the XXRI catalog, organised by what it does."),"xxri-page-sub",0),FALSE,FALSE,0);
+    GtkWidget* fb=gtk_flow_box_new();
+    gtk_widget_set_margin_top(fb,12);
+    gtk_flow_box_set_selection_mode(GTK_FLOW_BOX(fb),GTK_SELECTION_NONE);
+    gtk_flow_box_set_max_children_per_line(GTK_FLOW_BOX(fb),3);
+    gtk_flow_box_set_row_spacing(GTK_FLOW_BOX(fb),8);
+    gtk_flow_box_set_column_spacing(GTK_FLOW_BOX(fb),8);
+    gtk_flow_box_set_homogeneous(GTK_FLOW_BOX(fb),TRUE);
+    for (int i=0;ALL_CATS[i];i++) {
+        GPtrArray* ap=apps_in_cat(ALL_CATS[i]); int cnt=ap->len; g_ptr_array_free(ap,TRUE);
+        GtkWidget* t=gtk_box_new(GTK_ORIENTATION_VERTICAL,2); css(t,"xxri-cat-tile");
+        gtk_box_pack_start(GTK_BOX(t),lbl(cat_title(ALL_CATS[i]),"xxri-cat-name",0),FALSE,FALSE,0);
+        char c[64]; snprintf(c,sizeof c,ngettext("%d app","%d apps",cnt),cnt);
+        gtk_box_pack_start(GTK_BOX(t),lbl(c,"xxri-cat-count",0),FALSE,FALSE,0);
+        GtkWidget* ev=gtk_event_box_new();
+        gtk_event_box_set_visible_window(GTK_EVENT_BOX(ev),FALSE);
+        gtk_container_add(GTK_CONTAINER(ev),t);
+        char pg[64]; snprintf(pg,sizeof pg,"cat:%s",ALL_CATS[i]);
+        g_signal_connect_data(ev,"button-press-event",G_CALLBACK(on_seeall),g_strdup(pg),(GClosureNotify)g_free,0);
+        gtk_flow_box_insert(GTK_FLOW_BOX(fb),ev,-1);
+    }
+    gtk_box_pack_start(GTK_BOX(box),fb,FALSE,FALSE,0);
+}
+
+static int cmp_rank(gconstpointer x,gconstpointer y){
+    const App* a=*(App**)x; const App* b=*(App**)y;
+    if (b->rank!=a->rank) return b->rank-a->rank;
+    return g_ascii_strcasecmp(a->name,b->name);
+}
+static void build_category(GtkWidget* box,const char* cat){
+    GPtrArray* ap;
+    if (!strcmp(cat,"all")) { ap=g_ptr_array_new();
+        for (guint i=0;i<g_apps->len;i++){ App* a=g_apps->pdata[i]; if(app_visible(a)) g_ptr_array_add(ap,a); } }
+    else ap=apps_in_cat(cat);
+    g_ptr_array_sort(ap,cmp_rank);
+    gtk_box_pack_start(GTK_BOX(box),lbl(!strcmp(cat,"all")?_("All apps"):cat_title(cat),"xxri-page-title",0),FALSE,FALSE,0);
+    int total=0; for(guint i=0;i<g_apps->len;i++){App*a=g_apps->pdata[i]; if((!strcmp(cat,"all")||!strcmp(a->category,cat))&&!app_installable(a)&&!app_installed(a)) total++; }
+    char s[128];
+    if (!g_show_incompat && total>0)
+        snprintf(s,sizeof s,ngettext("%d app \xc2\xb7 %d need XXRI Regular / Pro","%d apps \xc2\xb7 %d need XXRI Regular / Pro",ap->len),ap->len,total);
+    else snprintf(s,sizeof s,ngettext("%d app","%d apps",ap->len),ap->len);
+    gtk_box_pack_start(GTK_BOX(box),lbl(s,"xxri-page-sub",0),FALSE,FALSE,0);
+    if (!ap->len) { g_ptr_array_free(ap,TRUE);
+        gtk_box_pack_start(GTK_BOX(box),lbl(_("Nothing here yet."),"xxri-hint",0),FALSE,FALSE,0);
+        return; }
+    gtk_box_pack_start(GTK_BOX(box),lazy_grid(ap),FALSE,FALSE,0);
+}
+
+static void kv(GtkWidget* card,const char* k,const char* v){
+    if (!v||!*v) return;
+    GtkWidget* r=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,10); css(r,"xxri-rowitem");
+    gtk_box_pack_start(GTK_BOX(r),lbl(k,"xxri-key",0),FALSE,FALSE,0);
+    GtkWidget* val=lbl_ell(v,"xxri-val",1,40);
+    gtk_box_pack_end(GTK_BOX(r),val,TRUE,TRUE,0);
+    gtk_box_pack_start(GTK_BOX(card),r,FALSE,FALSE,0);
+}
+static GtkWidget* g_shot_box; static char* g_shot_id;
+static gboolean poll_shots(gpointer u){ (void)u;
+    static int tries=0;
+    if (!g_shot_box||!GTK_IS_WIDGET(g_shot_box)||!g_shot_id) { tries=0; return G_SOURCE_REMOVE; }
+    int found=0;
+    for (int i=0;i<3;i++) {
+        char p[1024]; snprintf(p,sizeof p,"%s/shots/%s-%d.png",g_cache,g_shot_id,i);
+        if (!g_file_test(p,G_FILE_TEST_EXISTS)) continue;
+        found++;
+    }
+    GList* ch=gtk_container_get_children(GTK_CONTAINER(g_shot_box));
+    int have=g_list_length(ch); g_list_free(ch);
+    if (found>have) {
+        ch=gtk_container_get_children(GTK_CONTAINER(g_shot_box));
+        for (GList* l=ch;l;l=l->next) gtk_widget_destroy(GTK_WIDGET(l->data));
+        g_list_free(ch);
+        for (int i=0;i<3;i++) {
+            char p[1024]; snprintf(p,sizeof p,"%s/shots/%s-%d.png",g_cache,g_shot_id,i);
+            if (!g_file_test(p,G_FILE_TEST_EXISTS)) continue;
+            GdkPixbuf* full=load_png(p,0,0);
+            if (!full) continue;
+            int w=gdk_pixbuf_get_width(full),h=gdk_pixbuf_get_height(full);
+            int th=170, tw=(int)((double)w*th/(h?h:1));
+            if (tw>520){ tw=520; th=(int)((double)h*tw/(w?w:1)); }
+            GdkPixbuf* sc=gdk_pixbuf_scale_simple(full,tw,th,GDK_INTERP_BILINEAR);
+            g_object_unref(full);
+            if (!sc) continue;
+            GtkWidget* im=gtk_image_new_from_pixbuf(sc); g_object_unref(sc);
+            css(im,"xxri-shot");
+            gtk_box_pack_start(GTK_BOX(g_shot_box),im,FALSE,FALSE,0);
+        }
+        gtk_widget_show_all(g_shot_box);
+    }
+    if (++tries>10) { tries=0; return G_SOURCE_REMOVE; }
+    return G_SOURCE_CONTINUE;
+}
+static void build_appdetail(GtkWidget* box,App* a){
+    /* header card */
+    GtkWidget* head=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,16); css(head,"xxri-card");
+    GtkWidget* hr=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,16); css(hr,"xxri-rowitem");
+    GtkWidget* ic=icon_img(a,88); gtk_widget_set_valign(ic,GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(hr),ic,FALSE,FALSE,0);
+    GtkWidget* tv=gtk_box_new(GTK_ORIENTATION_VERTICAL,4);
+    gtk_box_pack_start(GTK_BOX(tv),lbl_ell(a->name,"xxri-page-title",0,26),FALSE,FALSE,0);
+    gtk_box_pack_start(GTK_BOX(tv),lbl_ell(a->developer,"xxri-app-dev",0,40),FALSE,FALSE,0);
+    /* only fields that exist, most entries have no license or size */
+    char meta[256]; char* hs=human_size(a->size);
+    { const char* parts[3]; int n=0;
+      const char* cat=cat_title(a->category);
+      if (cat && *cat)          parts[n++]=cat;
+      if (a->license && *a->license) parts[n++]=a->license;
+      if (hs && *hs)            parts[n++]=hs;
+      meta[0]=0;
+      for (int i=0;i<n;i++) {
+          if (i) g_strlcat(meta," \xc2\xb7 ",sizeof meta);
+          g_strlcat(meta,parts[i],sizeof meta);
+      }
+    }
+    g_free(hs);
+    gtk_box_pack_start(GTK_BOX(tv),lbl_ell(meta,"xxri-app-summary",0,44),FALSE,FALSE,0);
+    GtkWidget* act=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,8);
+    gtk_widget_set_margin_top(act,6);
+    gtk_box_pack_start(GTK_BOX(act),action_button(a,TRUE),FALSE,FALSE,0);
+    if (app_installed(a)) {
+        if (app_updatable(a)) {
+            GtkWidget* o=gtk_button_new_with_label(_("Open")); css(o,"xxri-chip");
+            g_signal_connect(o,"clicked",G_CALLBACK(act_launch),a);
+            gtk_box_pack_start(GTK_BOX(act),o,FALSE,FALSE,0);
+        }
+        GtkWidget* rm=gtk_button_new_with_label(_("Remove")); css(rm,"xxri-chip");
+        g_signal_connect(rm,"clicked",G_CALLBACK(act_remove),a);
+        gtk_box_pack_start(GTK_BOX(act),rm,FALSE,FALSE,0);
+    }
+    if (*a->homepage) {
+        GtkWidget* wb=gtk_button_new_with_label(_("Website")); css(wb,"xxri-chip");
+        g_signal_connect(wb,"clicked",G_CALLBACK(act_website),a);
+        gtk_box_pack_start(GTK_BOX(act),wb,FALSE,FALSE,0);
+    }
+    gtk_box_pack_start(GTK_BOX(tv),act,FALSE,FALSE,0);
+    gtk_box_pack_start(GTK_BOX(hr),tv,TRUE,TRUE,0);
+    gtk_box_pack_start(GTK_BOX(head),hr,TRUE,TRUE,0);
+    gtk_box_pack_start(GTK_BOX(box),head,FALSE,FALSE,0);
+
+    /* an incompatible app must say so in plain words, not just grey out */
+    if (!app_compatible(a)) {
+        char* all=arch_join(a,_(" and "),_(" and "));
+        char* pa=primary_arch(a);
+        char msg[320];
+        snprintf(msg,sizeof msg,
+            _("This app is published for %s. XXRI Lite runs %s, so it cannot be installed here \xe2\x80\x94 "
+            "it is available on XXRI Regular and Pro, which are %s."),
+            all,g_arch,pa);
+        g_free(all); g_free(pa);
+        GtkWidget* h=lbl_wrap(msg,"xxri-hint warn",0,80);
+        gtk_widget_set_margin_top(h,10);
+        gtk_box_pack_start(GTK_BOX(box),h,FALSE,FALSE,0);
+    }
+
+    /* screenshots (cached lazily; the section only appears if there are any) */
+    if (a->nshots>0) {
+        gtk_box_pack_start(GTK_BOX(box),lbl(_("Screenshots"),"xxri-section",0),FALSE,FALSE,0);
+        GtkWidget* sc=gtk_scrolled_window_new(NULL,NULL);
+        gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sc),GTK_POLICY_EXTERNAL,GTK_POLICY_NEVER);
+        gtk_scrolled_window_set_overlay_scrolling(GTK_SCROLLED_WINDOW(sc),TRUE);
+        css(sc,"xxri-rail");
+        GtkWidget* row=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,10);
+        gtk_container_add(GTK_CONTAINER(sc),row);
+        gtk_widget_set_size_request(sc,-1,180);
+        gtk_box_pack_start(GTK_BOX(box),sc,FALSE,FALSE,0);
+        g_shot_box=row; g_free(g_shot_id); g_shot_id=g_strdup(a->id);
+        int have=0;
+        for (int i=0;i<3;i++){ char p[1024]; snprintf(p,sizeof p,"%s/shots/%s-%d.png",g_cache,a->id,i);
+            if (g_file_test(p,G_FILE_TEST_EXISTS)) have++; }
+        if (!have) {
+            GtkWidget* ph=lbl(g_online?_("Loading screenshots\xe2\x80\xa6"):_("Screenshots need an internet connection."),"xxri-hint",0);
+            gtk_box_pack_start(GTK_BOX(row),ph,FALSE,FALSE,0);
+        }
+        if (g_online) run_bg("xxri-store shots %s",a->id);
+        g_timeout_add(1200,poll_shots,NULL);
+        if (have) poll_shots(NULL);
+    }
+
+    gtk_box_pack_start(GTK_BOX(box),lbl(_("About"),"xxri-section",0),FALSE,FALSE,0);
+    GtkWidget* ac=gtk_box_new(GTK_ORIENTATION_VERTICAL,0); css(ac,"xxri-card");
+    GtkWidget* de=lbl_wrap(*a->description?a->description:a->summary,"xxri-val",0,80);
+    gtk_widget_set_margin_start(de,12); gtk_widget_set_margin_end(de,12);
+    gtk_widget_set_margin_top(de,12); gtk_widget_set_margin_bottom(de,12);
+    gtk_box_pack_start(GTK_BOX(ac),de,FALSE,FALSE,0);
+    gtk_box_pack_start(GTK_BOX(box),ac,FALSE,FALSE,0);
+
+    gtk_box_pack_start(GTK_BOX(box),lbl(_("Information"),"xxri-section",0),FALSE,FALSE,0);
+    GtkWidget* ic2=gtk_box_new(GTK_ORIENTATION_VERTICAL,0); css(ic2,"xxri-card");
+    kv(ic2,_("Developer"),a->developer);
+    kv(ic2,_("Publisher"),*a->publisher?a->publisher:a->developer);
+    kv(ic2,_("Version"),a->version);
+    if (app_installed(a)) {
+        char* low=g_ascii_strdown(a->name,-1);
+        const char* iv=g_hash_table_lookup(g_installed,low); g_free(low);
+        if (iv&&*iv) kv(ic2,_("Installed version"),iv);
+    }
+    kv(ic2,_("Release date"),a->release_date);
+    kv(ic2,_("Category"),cat_title(a->category));
+    char* archs=g_strdup(a->arch);
+    for (char* p=archs;*p;p++) if(*p=='\n')*p=' ';
+    kv(ic2,_("Architecture"),archs); g_free(archs);
+    kv(ic2,_("License"),a->license);
+    kv(ic2,_("Homepage"),a->homepage);
+    char* hs2=human_size(a->size);
+    if (*hs2) { kv(ic2,_("Download size"),hs2); kv(ic2,_("File size"),hs2); }
+    g_free(hs2);
+    if (*a->sha256 && strcmp(a->sha256,"-")) {
+        char sh[32]; g_strlcpy(sh,a->sha256,25); g_strlcat(sh,"\xe2\x80\xa6",sizeof sh);
+        kv(ic2,"SHA256",sh);
+    } else kv(ic2,"SHA256",_("Published at download time"));
+    const char* srcname = !strcmp(a->source_type,"github") ? _("GitHub Releases")
+                        : !strcmp(a->source_type,"gitlab") ? _("GitLab Releases")
+                        : !strcmp(a->source_type,"direct") ? _("Developer website")
+                        : !strcmp(a->source_type,"local")  ? _("Bundled with XXRI OS")
+                        : !strcmp(a->source_type,"xxri")   ? _("XXRI Repository") : a->source_type;
+    kv(ic2,_("Source"),srcname);
+    if (*a->source_ref) kv(ic2,_("Source project"),a->source_ref);
+    kv(ic2,_("Package type"),!strcmp(a->kind,"appimage")?"AppImage":a->kind);
+    gtk_box_pack_start(GTK_BOX(box),ic2,FALSE,FALSE,0);
+
+    if (*a->permissions) {
+        gtk_box_pack_start(GTK_BOX(box),lbl(_("Permissions"),"xxri-section",0),FALSE,FALSE,0);
+        GtkWidget* pc=gtk_box_new(GTK_ORIENTATION_VERTICAL,0); css(pc,"xxri-card");
+        char** ps=g_strsplit(a->permissions,"\n",-1);
+        for (int i=0;ps[i];i++) {
+            if (!*ps[i]) continue;
+            GtkWidget* r=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,0); css(r,"xxri-rowitem");
+            gtk_box_pack_start(GTK_BOX(r),lbl(ps[i],"xxri-val",0),FALSE,FALSE,0);
+            gtk_box_pack_start(GTK_BOX(pc),r,FALSE,FALSE,0);
+        }
+        g_strfreev(ps);
+        gtk_box_pack_start(GTK_BOX(box),pc,FALSE,FALSE,0);
+    }
+    if (*a->deps) {
+        gtk_box_pack_start(GTK_BOX(box),lbl(_("Dependencies"),"xxri-section",0),FALSE,FALSE,0);
+        GtkWidget* dc=gtk_box_new(GTK_ORIENTATION_VERTICAL,0); css(dc,"xxri-card");
+        char** ds=g_strsplit(a->deps,"\n",-1);
+        for (int i=0;ds[i];i++){ if(!*ds[i])continue;
+            GtkWidget* r=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,0); css(r,"xxri-rowitem");
+            gtk_box_pack_start(GTK_BOX(r),lbl(ds[i],"xxri-val",0),FALSE,FALSE,0);
+            gtk_box_pack_start(GTK_BOX(dc),r,FALSE,FALSE,0); }
+        g_strfreev(ds);
+        gtk_box_pack_start(GTK_BOX(box),dc,FALSE,FALSE,0);
+    }
+    if (*a->changelog) {
+        gtk_box_pack_start(GTK_BOX(box),lbl(_("What's new"),"xxri-section",0),FALSE,FALSE,0);
+        GtkWidget* cc=gtk_box_new(GTK_ORIENTATION_VERTICAL,0); css(cc,"xxri-card");
+        GtkWidget* t=lbl_wrap(a->changelog,"xxri-val",0,80);
+        gtk_label_set_lines(GTK_LABEL(t),14);
+        gtk_label_set_ellipsize(GTK_LABEL(t),PANGO_ELLIPSIZE_END);
+        gtk_widget_set_margin_start(t,12); gtk_widget_set_margin_end(t,12);
+        gtk_widget_set_margin_top(t,12); gtk_widget_set_margin_bottom(t,12);
+        gtk_box_pack_start(GTK_BOX(cc),t,FALSE,FALSE,0);
+        gtk_box_pack_start(GTK_BOX(box),cc,FALSE,FALSE,0);
+    }
+}
+
+static GtkWidget *g_res_box, *g_res_count;
+static GtkWidget *g_f_cat, *g_f_arch, *g_f_pub, *g_f_inst, *g_f_upd;
+static void do_search(void){
+    if (!g_res_box) return;
+    GList* ch=gtk_container_get_children(GTK_CONTAINER(g_res_box));
+    for (GList* l=ch;l;l=l->next) gtk_widget_destroy(GTK_WIDGET(l->data));
+    g_list_free(ch);
+    const char* q=g_search_entry?gtk_entry_get_text(GTK_ENTRY(g_search_entry)):"";
+    char* ql=g_utf8_strdown(q,-1); g_strstrip(ql);
+    char* cat = g_f_cat?gtk_combo_box_text_get_active_text(GTK_COMBO_BOX_TEXT(g_f_cat)):NULL;
+    char* arch= g_f_arch?gtk_combo_box_text_get_active_text(GTK_COMBO_BOX_TEXT(g_f_arch)):NULL;
+    char* pub = g_f_pub?gtk_combo_box_text_get_active_text(GTK_COMBO_BOX_TEXT(g_f_pub)):NULL;
+    gboolean only_inst = g_f_inst && gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(g_f_inst));
+    gboolean only_upd  = g_f_upd  && gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(g_f_upd));
+    GPtrArray* r=g_ptr_array_new();
+    for (guint i=0;i<g_apps->len;i++) {
+        App* a=g_apps->pdata[i];
+        if (*ql) {
+            /* name, publisher, description, keywords, category and tags */
+            char* nl=g_utf8_strdown(a->name,-1);
+            char* sl=g_utf8_strdown(a->summary,-1);
+            char* dl=g_utf8_strdown(a->developer,-1);
+            char* pl=g_utf8_strdown(a->publisher,-1);
+            char* de=g_utf8_strdown(a->description,-1);
+            char* kw=g_utf8_strdown(a->keywords?a->keywords:"",-1);
+            char* tg=g_utf8_strdown(a->tags,-1);
+            const char* ct=cat_title(a->category);
+            char* cl=g_utf8_strdown(ct,-1);
+            gboolean hit = strstr(nl,ql)||strstr(sl,ql)||strstr(dl,ql)||strstr(pl,ql)
+                         ||strstr(de,ql)||strstr(kw,ql)||strstr(tg,ql)||strstr(cl,ql);
+            g_free(nl);g_free(sl);g_free(dl);g_free(pl);g_free(de);g_free(kw);g_free(tg);g_free(cl);
+            if (!hit) continue;
+        }
+        if (cat && strcmp(cat,_("All categories")) && strcmp(cat_title(a->category),cat)) continue;
+        /* hide incompatible unless the toggle is on OR the user picked an arch */
+        gboolean arch_picked = arch && strcmp(arch,_("Any architecture")) && strcmp(arch,_("Runs on this device"));
+        if (!g_show_incompat && !arch_picked && !app_visible(a)) continue;
+        if (arch && strcmp(arch,_("Any architecture"))) {
+            if (!strcmp(arch,_("Runs on this device"))) { if (!app_compatible(a)) continue; }
+            else if (!strstr(a->arch,arch)) continue;
+        }
+        if (pub && strcmp(pub,_("All publishers")) && strcmp(a->developer,pub)) continue;
+        if (only_inst && !app_installed(a)) continue;
+        if (only_upd && !app_updatable(a)) continue;
+        g_ptr_array_add(r,a);
+    }
+    g_ptr_array_sort(r,cmp_rank);
+    if (g_res_count) {
+        char c[96];
+        snprintf(c,sizeof c,*ql?ngettext("%d result","%d results",r->len)
+                              :ngettext("%d result \xc2\xb7 type to narrow it down","%d results \xc2\xb7 type to narrow it down",r->len),
+                 r->len);
+        gtk_label_set_text(GTK_LABEL(g_res_count),c);
+    }
+    if (!r->len) {
+        g_ptr_array_free(r,TRUE);
+        gtk_box_pack_start(GTK_BOX(g_res_box),
+            lbl_wrap(_("No apps match that. Try a different word, or clear the filters."),"xxri-hint",0,60),FALSE,FALSE,0);
+    } else {
+        gtk_box_pack_start(GTK_BOX(g_res_box),lazy_grid(r),FALSE,FALSE,0);
+    }
+    g_free(ql); g_free(cat); g_free(arch); g_free(pub);
+    gtk_widget_show_all(g_res_box);
+}
+static void on_filter(GtkWidget* w,gpointer u){ (void)w;(void)u; do_search(); }
+static void build_search(GtkWidget* box){
+    gtk_box_pack_start(GTK_BOX(box),lbl(_("Search"),"xxri-page-title",0),FALSE,FALSE,0);
+    /* filters: category, architecture, publisher, installed, updates */
+    GtkWidget* fr=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,8);
+    gtk_widget_set_margin_top(fr,8);
+    g_f_cat=gtk_combo_box_text_new();
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(g_f_cat),_("All categories"));
+    for (int i=0;ALL_CATS[i];i++) {
+        GPtrArray* ap=apps_in_cat(ALL_CATS[i]); int n=ap->len; g_ptr_array_free(ap,TRUE);
+        if (n) gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(g_f_cat),cat_title(ALL_CATS[i]));
+    }
+    gtk_combo_box_set_active(GTK_COMBO_BOX(g_f_cat),0);
+    g_signal_connect(g_f_cat,"changed",G_CALLBACK(on_filter),NULL);
+    gtk_box_pack_start(GTK_BOX(fr),g_f_cat,FALSE,FALSE,0);
+
+    g_f_arch=gtk_combo_box_text_new();
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(g_f_arch),_("Any architecture"));
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(g_f_arch),_("Runs on this device"));
+    const char* AR[]={"i686","x86_64","aarch64","arm",NULL};
+    for (int i=0;AR[i];i++) gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(g_f_arch),AR[i]);
+    gtk_combo_box_set_active(GTK_COMBO_BOX(g_f_arch),0);
+    g_signal_connect(g_f_arch,"changed",G_CALLBACK(on_filter),NULL);
+    gtk_box_pack_start(GTK_BOX(fr),g_f_arch,FALSE,FALSE,0);
+
+    /* only publishers with 3+ apps, or the list runs to hundreds */
+    g_f_pub=gtk_combo_box_text_new();
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(g_f_pub),_("All publishers"));
+    GHashTable* pc=g_hash_table_new(g_str_hash,g_str_equal);
+    for (guint i=0;i<g_apps->len;i++) { App* a=g_apps->pdata[i];
+        if (!*a->developer) continue;
+        gpointer n=g_hash_table_lookup(pc,a->developer);
+        g_hash_table_replace(pc,a->developer,GINT_TO_POINTER(GPOINTER_TO_INT(n)+1)); }
+    GList* keys=g_hash_table_get_keys(pc);
+    keys=g_list_sort(keys,(GCompareFunc)g_ascii_strcasecmp);
+    for (GList* l=keys;l;l=l->next)
+        if (GPOINTER_TO_INT(g_hash_table_lookup(pc,l->data))>=3)
+            gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(g_f_pub),l->data);
+    g_list_free(keys); g_hash_table_destroy(pc);
+    gtk_combo_box_set_active(GTK_COMBO_BOX(g_f_pub),0);
+    g_signal_connect(g_f_pub,"changed",G_CALLBACK(on_filter),NULL);
+    gtk_box_pack_start(GTK_BOX(fr),g_f_pub,FALSE,FALSE,0);
+
+    g_f_inst=gtk_toggle_button_new_with_label(_("Installed"));
+    css(g_f_inst,"xxri-chip");
+    g_signal_connect(g_f_inst,"toggled",G_CALLBACK(on_filter),NULL);
+    gtk_box_pack_start(GTK_BOX(fr),g_f_inst,FALSE,FALSE,0);
+    g_f_upd=gtk_toggle_button_new_with_label(_("Updates"));
+    css(g_f_upd,"xxri-chip");
+    g_signal_connect(g_f_upd,"toggled",G_CALLBACK(on_filter),NULL);
+    gtk_box_pack_start(GTK_BOX(fr),g_f_upd,FALSE,FALSE,0);
+    gtk_box_pack_start(GTK_BOX(box),fr,FALSE,FALSE,0);
+
+    g_res_count=lbl("","xxri-page-sub",0);
+    gtk_widget_set_margin_top(g_res_count,8);
+    gtk_box_pack_start(GTK_BOX(box),g_res_count,FALSE,FALSE,0);
+    g_res_box=gtk_box_new(GTK_ORIENTATION_VERTICAL,0);
+    gtk_box_pack_start(GTK_BOX(box),g_res_box,FALSE,FALSE,0);
+    do_search();
+}
+
+static void draw_glyph(cairo_t* cr,int g,double S,gboolean on);  /* rail glyphs */
+/* centred empty state like Settings': the page's rail glyph in a soft badge,
+   a title and a muted line */
+static gboolean empty_badge_draw(GtkWidget* w,cairo_t* cr,gpointer u){
+    int glyph=GPOINTER_TO_INT(u);
+    GtkAllocation al; gtk_widget_get_allocation(w,&al);
+    double S=al.width;
+    if (xxri_theme_dark()) cairo_set_source_rgba(cr,1,1,1,0.06);
+    else cairo_set_source_rgba(cr,0,0,0,0.05);
+    cairo_arc(cr,S/2,S/2,S/2,0,2*G_PI); cairo_fill(cr);
+    double g=S*0.46;
+    cairo_save(cr); cairo_translate(cr,(S-g)/2,(S-g)/2);
+    draw_glyph(cr,glyph,g,TRUE);
+    cairo_restore(cr);
+    return FALSE;
+}
+static GtkWidget* empty_state(int glyph,const char* title,const char* sub){
+    GtkWidget* w=gtk_box_new(GTK_ORIENTATION_VERTICAL,12);
+    gtk_widget_set_valign(w,GTK_ALIGN_CENTER);
+    gtk_widget_set_halign(w,GTK_ALIGN_CENTER);
+    gtk_widget_set_margin_top(w,40);
+    GtkWidget* da=gtk_drawing_area_new();
+    gtk_widget_set_size_request(da,78,78);
+    gtk_widget_set_halign(da,GTK_ALIGN_CENTER);
+    g_signal_connect(da,"draw",G_CALLBACK(empty_badge_draw),GINT_TO_POINTER(glyph));
+    gtk_box_pack_start(GTK_BOX(w),da,FALSE,FALSE,0);
+    GtkWidget* t=lbl(title,"xxri-empty-title",0.5);
+    gtk_label_set_justify(GTK_LABEL(t),GTK_JUSTIFY_CENTER);
+    gtk_box_pack_start(GTK_BOX(w),t,FALSE,FALSE,0);
+    GtkWidget* sl=lbl_wrap(sub,"xxri-empty-sub",0.5,46);
+    gtk_label_set_justify(GTK_LABEL(sl),GTK_JUSTIFY_CENTER);
+    gtk_box_pack_start(GTK_BOX(w),sl,FALSE,FALSE,0);
+    return w;
+}
+static void act_openloc(GtkWidget* w,gpointer p){ (void)w; run_bg("xxri-store open-location %s",(char*)p); }
+static void build_installed(GtkWidget* box){
+    gtk_box_pack_start(GTK_BOX(box),lbl(_("Installed apps"),"xxri-page-title",0),FALSE,FALSE,0);
+    char* js=run_cmd("xxri-store installed");
+    GPtrArray* a=jarr(js,"apps");
+    char s[128]; snprintf(s,sizeof s,ngettext("%d app from the XXRI registry","%d apps from the XXRI registry",a->len),a->len);
+    gtk_box_pack_start(GTK_BOX(box),lbl(s,"xxri-page-sub",0),FALSE,FALSE,0);
+    if (!a->len) {
+        gtk_box_pack_start(GTK_BOX(box),
+            empty_state(5,_("No apps yet"),
+                _("Everything you install from the Store shows up here, with a Launch "
+                "button and the date you installed it.")),TRUE,TRUE,0);
+    } else {
+        GtkWidget* card=gtk_box_new(GTK_ORIENTATION_VERTICAL,0); css(card,"xxri-card");
+        gtk_widget_set_margin_top(card,10);
+        for (guint i=0;i<a->len;i++) {
+            char* o=a->pdata[i];
+            char* rid=jget(o,"id"); char* nm=jget(o,"name"); char* vr=jget(o,"version");
+            char* ll=jget(o,"last_launch"); char* inst=jget(o,"installed"); char* cid=jget(o,"catalog_id");
+            App* ca = *cid ? g_hash_table_lookup(g_byid,cid) : NULL;
+            if (!ca) for (guint k=0;k<g_apps->len;k++){ App* x=g_apps->pdata[k];
+                if(!g_ascii_strcasecmp(x->name,nm)){ ca=x; break; } }
+            GtkWidget* r=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,12); css(r,"xxri-rowitem");
+            if (ca) { GtkWidget* ic=icon_img(ca,44); gtk_widget_set_valign(ic,GTK_ALIGN_CENTER);
+                gtk_box_pack_start(GTK_BOX(r),ic,FALSE,FALSE,0); }
+            GtkWidget* tv=gtk_box_new(GTK_ORIENTATION_VERTICAL,2);
+            gtk_widget_set_valign(tv,GTK_ALIGN_CENTER);
+            gtk_box_pack_start(GTK_BOX(tv),lbl_ell(nm,"xxri-row-title",0,30),FALSE,FALSE,0);
+            char sub[256];
+            snprintf(sub,sizeof sub,_("Version %s \xc2\xb7 installed %s \xc2\xb7 last opened %s"),
+                     vr,*inst?inst:"\xe2\x80\x94",(ll&&*ll&&strcmp(ll,"never"))?ll:_("never"));
+            gtk_box_pack_start(GTK_BOX(tv),lbl_ell(sub,"xxri-row-sub",0,60),FALSE,FALSE,0);
+            gtk_box_pack_start(GTK_BOX(r),tv,TRUE,TRUE,0);
+            GtkWidget* bl=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,6);
+            gtk_widget_set_valign(bl,GTK_ALIGN_CENTER);
+            if (ca && app_updatable(ca)) {
+                GtkWidget* up=gtk_button_new_with_label(_("Update")); css(up,"xxri-accent");
+                g_signal_connect(up,"clicked",G_CALLBACK(act_update),ca);
+                gtk_box_pack_start(GTK_BOX(bl),up,FALSE,FALSE,0);
+            }
+            GtkWidget* op=gtk_button_new_with_label(_("Launch"));
+            css(op,ca&&app_updatable(ca)?"xxri-chip":"xxri-accent");
+            g_object_set_data_full(G_OBJECT(op),"rid",g_strdup(rid),g_free);
+            g_signal_connect(op,"clicked",G_CALLBACK(+[](GtkWidget* w,gpointer d){ (void)d;
+                run_bg("xxri-app launch %s",(char*)g_object_get_data(G_OBJECT(w),"rid")); }),NULL);
+            gtk_box_pack_start(GTK_BOX(bl),op,FALSE,FALSE,0);
+            GtkWidget* fo=gtk_button_new_with_label(_("Folder")); css(fo,"xxri-chip");
+            g_signal_connect_data(fo,"clicked",G_CALLBACK(act_openloc),g_strdup(rid),(GClosureNotify)g_free,0);
+            gtk_box_pack_start(GTK_BOX(bl),fo,FALSE,FALSE,0);
+            if (ca) {
+                GtkWidget* rm=gtk_button_new_with_label(_("Remove")); css(rm,"xxri-chip");
+                g_signal_connect(rm,"clicked",G_CALLBACK(act_remove),ca);
+                gtk_box_pack_start(GTK_BOX(bl),rm,FALSE,FALSE,0);
+            }
+            gtk_box_pack_end(GTK_BOX(r),bl,FALSE,FALSE,0);
+            gtk_box_pack_start(GTK_BOX(card),r,FALSE,FALSE,0);
+            g_free(rid);g_free(nm);g_free(vr);g_free(ll);g_free(inst);g_free(cid);
+        }
+        gtk_box_pack_start(GTK_BOX(box),card,FALSE,FALSE,0);
+    }
+    g_ptr_array_free(a,TRUE); g_free(js);
+}
+
+static void act_update_all(GtkWidget* w,gpointer p){ (void)w;(void)p;
+    run_bg("xxri-store update-all");
+    open_page("downloads");
+}
+static void build_updates(GtkWidget* box){
+    GtkWidget* hb=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,8);
+    gtk_box_pack_start(GTK_BOX(hb),lbl(_("Updates"),"xxri-page-title",0),TRUE,TRUE,0);
+    char* js=(g_upd_json && *g_upd_json) ? g_strdup(g_upd_json) : run_cmd("xxri-store updates");
+    GPtrArray* a=jarr(js,"updates");
+    if (a->len) {
+        GtkWidget* ua=gtk_button_new_with_label(_("Update all")); css(ua,"xxri-accent");
+        gtk_widget_set_valign(ua,GTK_ALIGN_CENTER);
+        g_signal_connect(ua,"clicked",G_CALLBACK(act_update_all),NULL);
+        gtk_box_pack_end(GTK_BOX(hb),ua,FALSE,FALSE,0);
+    }
+    gtk_box_pack_start(GTK_BOX(box),hb,FALSE,FALSE,0);
+    if (!a->len) {
+        char sub[128];
+        snprintf(sub,sizeof sub,"%s \xc2\xb7 %s",
+                 g_online?_("Checked against the online catalog"):_("Checked against the offline catalog"),
+                 g_repo_kind?g_repo_kind:_("bundled"));
+        gtk_box_pack_start(GTK_BOX(box),lbl(sub,"xxri-page-sub",0),FALSE,FALSE,0);
+        GtkWidget* h=lbl_wrap(_("Everything is up to date. The Store compares every installed app "
+                              "against the catalog each time it opens."),"xxri-hint",0,60);
+        gtk_widget_set_margin_top(h,10);
+        gtk_box_pack_start(GTK_BOX(box),h,FALSE,FALSE,0);
+    } else {
+        char s[128]; snprintf(s,sizeof s,ngettext("%d update available","%d updates available",a->len),a->len);
+        gtk_box_pack_start(GTK_BOX(box),lbl(s,"xxri-page-sub",0),FALSE,FALSE,0);
+        GtkWidget* card=gtk_box_new(GTK_ORIENTATION_VERTICAL,0); css(card,"xxri-card");
+        gtk_widget_set_margin_top(card,10);
+        for (guint i=0;i<a->len;i++) {
+            char* o=a->pdata[i];
+            char* nm=jget(o,"name"); char* cur=jget(o,"current"); char* lat=jget(o,"latest");
+            char* cid=jget(o,"catalog_id"); char* szs=jget(o,"size");
+            App* ca=g_hash_table_lookup(g_byid,cid);
+            GtkWidget* r=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,12); css(r,"xxri-rowitem");
+            if (ca) { GtkWidget* ic=icon_img(ca,44); gtk_widget_set_valign(ic,GTK_ALIGN_CENTER);
+                gtk_box_pack_start(GTK_BOX(r),ic,FALSE,FALSE,0); }
+            GtkWidget* tv=gtk_box_new(GTK_ORIENTATION_VERTICAL,2);
+            gtk_box_pack_start(GTK_BOX(tv),lbl(nm,"xxri-row-title",0),FALSE,FALSE,0);
+            char* hs=human_size(g_ascii_strtoll(szs,NULL,10));
+            char sub[192];
+            snprintf(sub,sizeof sub,"%s \xe2\x86\x92 %s%s%s",cur,lat,*hs?" \xc2\xb7 ":"",hs);
+            g_free(hs);
+            gtk_box_pack_start(GTK_BOX(tv),lbl(sub,"xxri-row-sub",0),FALSE,FALSE,0);
+            if (ca && *ca->changelog) {
+                GtkWidget* cl=lbl_ell(ca->changelog,"xxri-row-sub",0,70);
+                gtk_box_pack_start(GTK_BOX(tv),cl,FALSE,FALSE,0);
+            }
+            gtk_box_pack_start(GTK_BOX(r),tv,TRUE,TRUE,0);
+            GtkWidget* up=gtk_button_new_with_label(_("Update")); css(up,"xxri-accent");
+            gtk_widget_set_valign(up,GTK_ALIGN_CENTER);
+            if (ca) g_signal_connect(up,"clicked",G_CALLBACK(act_update),ca);
+            else { g_object_set_data_full(G_OBJECT(up),"cid",g_strdup(cid),g_free);
+                   g_signal_connect(up,"clicked",G_CALLBACK(act_update_id),NULL); }
+            gtk_box_pack_end(GTK_BOX(r),up,FALSE,FALSE,0);
+            gtk_box_pack_start(GTK_BOX(card),r,FALSE,FALSE,0);
+            g_free(nm);g_free(cur);g_free(lat);g_free(cid);g_free(szs);
+        }
+        gtk_box_pack_start(GTK_BOX(box),card,FALSE,FALSE,0);
+    }
+    g_ptr_array_free(a,TRUE); g_free(js);
+}
+
+static GtkWidget* g_dl_list;
+static void dl_action(GtkWidget* w,gpointer p){
+    const char* verb=g_object_get_data(G_OBJECT(w),"verb");
+    char* out=run_cmd("xxri-store %s %s",verb,(char*)p);
+    g_free(out);
+    if (!strcmp(verb,"retry")||!strcmp(verb,"resume")) run_bg("xxri-store install %s",(char*)p);
+    refresh_state();
+}
+static gboolean poll_downloads(gpointer timer){   /* NULL: the first, direct call */
+    if (!g_dl_list||!GTK_IS_WIDGET(g_dl_list)) { if (timer) g_dl_timer=0; return G_SOURCE_REMOVE; }
+    GList* ch=gtk_container_get_children(GTK_CONTAINER(g_dl_list));
+    for (GList* l=ch;l;l=l->next) gtk_widget_destroy(GTK_WIDGET(l->data));
+    g_list_free(ch);
+    char* js=run_cmd("xxri-store downloads");
+    GPtrArray* a=jarr(js,"downloads");
+    if (!a->len) {
+        gtk_container_add(GTK_CONTAINER(g_dl_list),
+            empty_state(3,_("Nothing downloading"),
+                _("Downloads you start appear here with progress, speed and time left "
+                "\xe2\x80\x94 and they survive a reboot.")));
+    }
+    for (guint i=0;i<a->len;i++) {
+        char* o=a->pdata[i];
+        char* id=jget(o,"id"); char* nm=jget(o,"name"); char* st=jget(o,"state");
+        char* pct=jget(o,"pct"); char* by=jget(o,"bytes"); char* tot=jget(o,"total");
+        char* sp=jget(o,"speed"); char* eta=jget(o,"eta"); char* err=jget(o,"error");
+        GtkWidget* r=gtk_box_new(GTK_ORIENTATION_VERTICAL,6); css(r,"xxri-rowitem");
+        GtkWidget* top=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,8);
+        App* ca=g_hash_table_lookup(g_byid,id);
+        if (ca) { GtkWidget* ic=icon_img(ca,36); gtk_widget_set_valign(ic,GTK_ALIGN_CENTER);
+            gtk_box_pack_start(GTK_BOX(top),ic,FALSE,FALSE,0); }
+        GtkWidget* tv=gtk_box_new(GTK_ORIENTATION_VERTICAL,1);
+        gtk_box_pack_start(GTK_BOX(tv),lbl(nm,"xxri-row-title",0),FALSE,FALSE,0);
+        const char* pretty = !strcmp(st,"downloading")?_("Downloading") : !strcmp(st,"queued")?_("Queued")
+                           : !strcmp(st,"verifying")?_("Verifying checksum") : !strcmp(st,"installing")?_("Installing")
+                           : !strcmp(st,"dependencies")?_("Installing required dependencies")
+                           : !strcmp(st,"resolving")?_("Finding the best source") : !strcmp(st,"completed")?_("Completed")
+                           : !strcmp(st,"paused")?_("Paused") : !strcmp(st,"failed")?_("Failed") : st;
+        char sub[320];
+        gint64 b=g_ascii_strtoll(by,NULL,10), t=g_ascii_strtoll(tot,NULL,10), s=g_ascii_strtoll(sp,NULL,10);
+        char* hb=human_size(b); char* ht=human_size(t); char* hsp=human_size(s);
+        int et=atoi(eta);
+        if (!strcmp(st,"downloading")) {
+            if (t>0 && s>0) snprintf(sub,sizeof sub,"%s \xc2\xb7 %s of %s \xc2\xb7 %s/s \xc2\xb7 %d:%02d left",
+                                     pretty,hb,ht,hsp,et/60,et%60);
+            else if (t>0) snprintf(sub,sizeof sub,"%s \xc2\xb7 %s of %s",pretty,hb,ht);
+            else snprintf(sub,sizeof sub,"%s \xc2\xb7 %s",pretty,hb);
+        } else if (*err) snprintf(sub,sizeof sub,"%s \xc2\xb7 %s",pretty,err);
+        else if (!strcmp(st,"completed")&&*ht) snprintf(sub,sizeof sub,"%s \xc2\xb7 %s",pretty,ht);
+        else snprintf(sub,sizeof sub,"%s",pretty);
+        g_free(hb);g_free(ht);g_free(hsp);
+        gtk_box_pack_start(GTK_BOX(tv),lbl_ell(sub,"xxri-row-sub",0,64),FALSE,FALSE,0);
+        gtk_box_pack_start(GTK_BOX(top),tv,TRUE,TRUE,0);
+        /* per-state controls */
+        GtkWidget* bl=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,6);
+        gtk_widget_set_valign(bl,GTK_ALIGN_CENTER);
+        struct { const char* label; const char* verb; } acts[3]; int na=0;
+        if (!strcmp(st,"downloading")) { acts[na].label=_("Pause"); acts[na].verb="pause"; na++;
+                                         acts[na].label=_("Cancel"); acts[na].verb="cancel"; na++; }
+        else if (!strcmp(st,"paused")) { acts[na].label=_("Resume"); acts[na].verb="resume"; na++;
+                                         acts[na].label=_("Cancel"); acts[na].verb="cancel"; na++; }
+        else if (!strcmp(st,"failed")) { acts[na].label=_("Retry"); acts[na].verb="retry"; na++;
+                                         acts[na].label=_("Clear"); acts[na].verb="clear"; na++; }
+        else if (!strcmp(st,"queued")) { acts[na].label=_("Cancel"); acts[na].verb="cancel"; na++; }
+        else if (!strcmp(st,"completed")) { acts[na].label=_("Clear"); acts[na].verb="clear"; na++; }
+        for (int k=0;k<na;k++) {
+            GtkWidget* b=gtk_button_new_with_label(acts[k].label);
+            css(b,strcmp(acts[k].verb,"retry")&&strcmp(acts[k].verb,"resume")?"xxri-chip":"xxri-accent");
+            g_object_set_data_full(G_OBJECT(b),"verb",g_strdup(acts[k].verb),g_free);
+            g_signal_connect_data(b,"clicked",G_CALLBACK(dl_action),g_strdup(id),(GClosureNotify)g_free,0);
+            gtk_box_pack_start(GTK_BOX(bl),b,FALSE,FALSE,0);
+        }
+        if (!strcmp(st,"completed") && ca && app_installed(ca)) {
+            GtkWidget* b=gtk_button_new_with_label(_("Open")); css(b,"xxri-accent");
+            g_signal_connect(b,"clicked",G_CALLBACK(act_launch),ca);
+            gtk_box_pack_start(GTK_BOX(bl),b,FALSE,FALSE,0);
+        }
+        gtk_box_pack_end(GTK_BOX(top),bl,FALSE,FALSE,0);
+        gtk_box_pack_start(GTK_BOX(r),top,FALSE,FALSE,0);
+        GtkWidget* pb=gtk_progress_bar_new(); css(pb,"xxri-progress");
+        double f=atoi(pct)/100.0; if(f<0)f=0; if(f>1)f=1;
+        if (!strcmp(st,"completed")) f=1;
+        gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(pb),f);
+        if (!strcmp(st,"failed")) css(pb,"fail");
+        else if (!strcmp(st,"completed")) css(pb,"done");
+        gtk_box_pack_start(GTK_BOX(r),pb,FALSE,FALSE,0);
+        gtk_container_add(GTK_CONTAINER(g_dl_list),r);
+        g_free(id);g_free(nm);g_free(st);g_free(pct);g_free(by);g_free(tot);
+        g_free(sp);g_free(eta);g_free(err);
+    }
+    g_ptr_array_free(a,TRUE); g_free(js);
+    gtk_widget_show_all(g_dl_list);
+    return G_SOURCE_CONTINUE;
+}
+static void act_clear_done(GtkWidget* w,gpointer p){ (void)w;(void)p;
+    char* o=run_cmd("xxri-store clear"); g_free(o); poll_downloads(NULL);
+}
+static void build_downloads(GtkWidget* box){
+    GtkWidget* hb=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,8);
+    gtk_box_pack_start(GTK_BOX(hb),lbl(_("Downloads"),"xxri-page-title",0),TRUE,TRUE,0);
+    GtkWidget* cl=gtk_button_new_with_label(_("Clear finished")); css(cl,"xxri-chip");
+    gtk_widget_set_valign(cl,GTK_ALIGN_CENTER);
+    g_signal_connect(cl,"clicked",G_CALLBACK(act_clear_done),NULL);
+    gtk_box_pack_end(GTK_BOX(hb),cl,FALSE,FALSE,0);
+    gtk_box_pack_start(GTK_BOX(box),hb,FALSE,FALSE,0);
+    GtkWidget* card=gtk_box_new(GTK_ORIENTATION_VERTICAL,0); css(card,"xxri-card");
+    gtk_widget_set_margin_top(card,10);
+    g_dl_list=card;
+    gtk_box_pack_start(GTK_BOX(box),card,FALSE,FALSE,0);
+    poll_downloads(NULL);
+    if (g_dl_timer) g_source_remove(g_dl_timer);   /* the page was opened again within a second */
+    g_dl_timer=g_timeout_add(1000,poll_downloads,GINT_TO_POINTER(1));
+}
+
+/* a page per catalog kind (themes); `soon` stands in while it has none */
+static void build_kind(GtkWidget* box,const char* kind,const char* title,const char* soon){
+    gtk_box_pack_start(GTK_BOX(box),lbl(title,"xxri-page-title",0),FALSE,FALSE,0);
+    GPtrArray* r=g_ptr_array_new();
+    for (guint i=0;i<g_apps->len;i++){ App* a=g_apps->pdata[i]; if(!strcmp(a->kind,kind)) g_ptr_array_add(r,a); }
+    if (!r->len) {
+        g_ptr_array_free(r,TRUE);
+        GtkWidget* h=lbl_wrap(soon,"xxri-hint",0,60);
+        gtk_widget_set_margin_top(h,10);
+        gtk_box_pack_start(GTK_BOX(box),h,FALSE,FALSE,0);
+        return;
+    }
+    gtk_box_pack_start(GTK_BOX(box),lazy_grid(r),FALSE,FALSE,0);
+}
+
+static GtkWidget* content_column(void){
+    GtkWidget* scr=gtk_scrolled_window_new(NULL,NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scr),GTK_POLICY_NEVER,GTK_POLICY_AUTOMATIC);
+    GtkWidget* outer=gtk_box_new(GTK_ORIENTATION_VERTICAL,0); css(outer,"xxri-content");
+    GtkWidget* col=gtk_box_new(GTK_ORIENTATION_VERTICAL,4);
+    gtk_widget_set_margin_start(col,22); gtk_widget_set_margin_end(col,22);
+    gtk_widget_set_margin_top(col,14); gtk_widget_set_margin_bottom(col,24);
+    gtk_widget_set_size_request(col,600,-1);
+    g_object_set_data(G_OBJECT(scr),"col",col);
+    gtk_box_pack_start(GTK_BOX(outer),col,TRUE,TRUE,0);
+    gtk_container_add(GTK_CONTAINER(scr),outer);
+    return scr;
+}
+static GtkWidget* build_page_content(const char* id){
+    if (g_pending_icons) g_ptr_array_free(g_pending_icons,TRUE);
+    g_pending_icons=g_ptr_array_new_with_free_func(iconwant_free);
+    g_res_box=NULL; g_res_count=NULL; g_dl_list=NULL; g_shot_box=NULL;
+    g_f_cat=g_f_arch=g_f_pub=g_f_inst=g_f_upd=NULL;
+
+    GtkWidget* scr=content_column();
+    GtkWidget* col=g_object_get_data(G_OBJECT(scr),"col");
+    if      (!strcmp(id,"home"))       build_home(col);
+    else if (!strcmp(id,"categories")) build_categories(col);
+    else if (!strcmp(id,"search"))     build_search(col);
+    else if (!strcmp(id,"installed"))  build_installed(col);
+    else if (!strcmp(id,"updates"))    build_updates(col);
+    else if (!strcmp(id,"downloads"))  build_downloads(col);
+    else if (!strcmp(id,"themes"))     build_kind(col,"theme",_("Themes"),
+        _("No themes in the catalog yet. When the XXRI repository starts publishing themes, "
+        "wallpapers and fonts, they appear right here \xe2\x80\x94 the Store already knows how to read them."));
+    else if (!strncmp(id,"cat:",4))    build_category(col,id+4);
+    else if (!strncmp(id,"app:",4))    { App* a=g_hash_table_lookup(g_byid,id+4); if(a) build_appdetail(col,a); }
+    /* keep the lazy grid fed as the user reaches the bottom; on_edge finds
+       the grid that is live then, which on the search page is a later one */
+    gtk_scrolled_window_set_kinetic_scrolling(GTK_SCROLLED_WINDOW(scr),TRUE);
+    g_signal_connect(scr,"edge-reached",G_CALLBACK(on_edge),NULL);
+    gtk_widget_show_all(scr);
+    kick_icon_fetch();
+    return scr;
+}
+static void rebuild(const char* id){
+    if (!id) return;
+    char* keep=g_strdup(id);
+    GtkWidget* old=gtk_stack_get_child_by_name(GTK_STACK(g_stack),keep);
+    GtkWidget* neu=build_page_content(keep);
+    if (old) { gtk_container_remove(GTK_CONTAINER(g_stack),old); }
+    gtk_stack_add_named(GTK_STACK(g_stack),neu,keep);
+    gtk_stack_set_visible_child(GTK_STACK(g_stack),neu);
+    if (g_page!=keep) { g_free(g_page); g_page=keep; }
+    if (g_rail) gtk_widget_queue_draw(g_rail);   /* Back, search and links change the page too */
+    if (g_getenv("XXRI_STORE_DEBUG")) {
+        guint ok=0; for (guint i=0;g_apps && i<g_apps->len;i++) if (app_installable(g_ptr_array_index(g_apps,i))) ok++;
+        dbg("NAV page=%s shown (%s: %u apps, %u installable here)", g_page, g_arch, g_apps?g_apps->len:0, ok);
+    }
+}
+static void open_page(const char* id){
+    dbg("NAV open page=%s from=%s", id, g_page?g_page:"-");
+    if (g_page && strcmp(g_page,id)) g_ptr_array_add(g_history,g_strdup(g_page));
+    rebuild(id);
+}
+static void show_app(App* a){ char pg[160]; snprintf(pg,sizeof pg,"app:%s",a->id); open_page(pg); }
+static void refresh_state(void){
+    load_installed();
+    /* free space decides whether an Install button is offered */
+    char* fk = run_cmd("df -k / 2>/dev/null | awk 'NR==2{print $4}'");
+    g_free_kb = g_ascii_strtoll(fk, NULL, 10);
+    g_free(fk);
+}
+
+/* Live refresh: re-render when the installed set, the updates or a download's
+ * final state change (from the Store or from xxri-app elsewhere). Progress
+ * isn't part of the signature, so running downloads aren't disturbed. */
+static guint g_live_sig = 0;
+static void sig_mix(guint* h, const char* str) { for (const char* p=str; *p; p++) *h=((*h<<5)+*h)+(guint)(unsigned char)*p; }
+static void sig_mix_stat(guint* h, const char* path) {
+    GStatBuf st;
+    if (!g_stat(path,&st)) { char b[96]; snprintf(b,sizeof b,"|%ld.%ld",(long)st.st_mtime,(long)st.st_size); sig_mix(h,b); }
+}
+static gint sig_cmp(gconstpointer a, gconstpointer b) { return strcmp(*(char* const*)a,*(char* const*)b); }
+/* What changed, from file timestamps only (no process started): the installed
+ * set, the catalog in use and each download's final state. Progress is left
+ * out so running downloads are not disturbed. */
+static guint live_signature(void){
+    guint h=5381;
+    const char* reg="/usr/local/share/xxri-apps";
+    GDir* d=g_dir_open(reg,0,NULL);
+    if (d) {
+        GPtrArray* names=g_ptr_array_new_with_free_func(g_free);
+        const char* n;
+        while ((n=g_dir_read_name(d))) g_ptr_array_add(names,g_strdup(n));
+        g_dir_close(d);
+        g_ptr_array_sort(names,sig_cmp);
+        for (guint i=0;i<names->len;i++) {
+            char* path=g_build_filename(reg,names->pdata[i],NULL);
+            sig_mix(&h,names->pdata[i]); sig_mix_stat(&h,path); g_free(path);
+        }
+        g_ptr_array_free(names,TRUE);
+    }
+    if (g_catalog_path && *g_catalog_path) sig_mix_stat(&h,g_catalog_path);
+    /* terminal download states only (not bytes), so completion shows at once */
+    char* dd=g_build_filename(g_cache?g_cache:"","downloads",NULL);
+    d=g_dir_open(dd,0,NULL);
+    if (d) {
+        GPtrArray* names=g_ptr_array_new_with_free_func(g_free);
+        const char* n;
+        while ((n=g_dir_read_name(d))) if (!g_str_has_suffix(n,".pid")) g_ptr_array_add(names,g_strdup(n));
+        g_dir_close(d);
+        g_ptr_array_sort(names,sig_cmp);
+        for (guint i=0;i<names->len;i++) {
+            char* path=g_build_filename(dd,names->pdata[i],NULL);
+            char* txt=NULL;
+            if (g_file_get_contents(path,&txt,NULL,NULL)) {
+                const char* st=strstr(txt,"STATE=");
+                if (st && (!strncmp(st+6,"completed",9)||!strncmp(st+6,"failed",6)||!strncmp(st+6,"cancelled",9))) {
+                    sig_mix(&h,names->pdata[i]);
+                    char line[24]; g_strlcpy(line,st+6,sizeof line); char* nl=strchr(line,'\n'); if (nl) *nl=0;
+                    sig_mix(&h,line);
+                }
+                g_free(txt);
+            }
+            g_free(path);
+        }
+        g_ptr_array_free(names,TRUE);
+    }
+    g_free(dd);
+    return h;
+}
+static gboolean poll_live(gpointer u){ (void)u;
+    if (g_live_busy) return G_SOURCE_CONTINUE;          /* a load is still running */
+    guint s=live_signature();
+    if (s==g_live_sig) return G_SOURCE_CONTINUE;
+    g_live_sig=s;
+    load_installed_async();
+    return G_SOURCE_CONTINUE;
+}
+static void go_back(GtkWidget* w,gpointer u){ (void)w;(void)u;
+    if (!g_history->len) return;
+    char* prev=g_ptr_array_index(g_history,g_history->len-1);
+    g_ptr_array_remove_index(g_history,g_history->len-1);
+    rebuild(prev); g_free(prev);
+}
+
+/* the icon rail; glyphs are cairo, no bitmaps to keep in sync */
+typedef struct { const char* id; const char* label; int glyph; } Rail;
+static const Rail RAIL[]={
+    {"home",N_("Home"),0},{"categories",N_("Categories"),1},{"search",N_("Search"),2},
+    {"downloads",N_("Downloads"),3},{"updates",N_("Updates"),4},{"installed",N_("My apps"),5},
+};
+static void draw_glyph(cairo_t* cr,int g,double S,gboolean on){
+    gboolean dk=xxri_theme_dark();
+    if (on) { if (dk) cairo_set_source_rgb(cr,0.298,0.576,0.973);   /* accent */
+              else    cairo_set_source_rgb(cr,0.180,0.486,0.965); }
+    else if (dk) cairo_set_source_rgba(cr,0.949,0.949,0.957,0.78);   /* ink */
+    else    cairo_set_source_rgba(cr,0.11,0.11,0.118,0.78);
+    cairo_set_line_width(cr,1.7);
+    cairo_set_line_cap(cr,CAIRO_LINE_CAP_ROUND);
+    cairo_set_line_join(cr,CAIRO_LINE_JOIN_ROUND);
+    switch (g) {
+    case 0: /* shopping bag */
+        cairo_move_to(cr,S*0.24,S*0.34); cairo_line_to(cr,S*0.76,S*0.34);
+        cairo_line_to(cr,S*0.70,S*0.80); cairo_line_to(cr,S*0.30,S*0.80);
+        cairo_close_path(cr); cairo_stroke(cr);
+        cairo_arc(cr,S*0.50,S*0.34,S*0.14,G_PI,2*G_PI); cairo_stroke(cr);
+        break;
+    case 1: /* grid */
+        for (int r=0;r<2;r++) for (int c=0;c<2;c++) {
+            rr_path(cr,S*(0.26+c*0.26),S*(0.26+r*0.26),S*0.20,S*0.20,S*0.05);
+            cairo_stroke(cr);
+        }
+        break;
+    case 2: /* magnifier */
+        cairo_arc(cr,S*0.46,S*0.46,S*0.19,0,2*G_PI); cairo_stroke(cr);
+        cairo_move_to(cr,S*0.60,S*0.60); cairo_line_to(cr,S*0.76,S*0.76); cairo_stroke(cr);
+        break;
+    case 3: /* download */
+        cairo_move_to(cr,S*0.5,S*0.24); cairo_line_to(cr,S*0.5,S*0.60); cairo_stroke(cr);
+        cairo_move_to(cr,S*0.34,S*0.46); cairo_line_to(cr,S*0.5,S*0.62);
+        cairo_line_to(cr,S*0.66,S*0.46); cairo_stroke(cr);
+        cairo_move_to(cr,S*0.28,S*0.76); cairo_line_to(cr,S*0.72,S*0.76); cairo_stroke(cr);
+        break;
+    case 4: /* refresh */
+        cairo_arc(cr,S*0.5,S*0.5,S*0.22,G_PI*0.15,G_PI*1.6); cairo_stroke(cr);
+        cairo_move_to(cr,S*0.70,S*0.30); cairo_line_to(cr,S*0.72,S*0.50);
+        cairo_line_to(cr,S*0.54,S*0.44); cairo_close_path(cr); cairo_fill(cr);
+        break;
+    default: /* checklist */
+        rr_path(cr,S*0.26,S*0.24,S*0.48,S*0.52,S*0.10); cairo_stroke(cr);
+        cairo_move_to(cr,S*0.37,S*0.50); cairo_line_to(cr,S*0.46,S*0.60);
+        cairo_line_to(cr,S*0.64,S*0.38); cairo_stroke(cr);
+        break;
+    }
+}
+typedef struct { int glyph; const char* id; GtkWidget* ev; } RailBtn;
+static gboolean draw_rail_btn(GtkWidget* w,cairo_t* cr,gpointer u){
+    RailBtn* rb=u;
+    GtkAllocation al; gtk_widget_get_allocation(w,&al);
+    gboolean on = g_page && (!strcmp(g_page,rb->id) ||
+                  (!strcmp(rb->id,"categories") && !strncmp(g_page,"cat:",4)));
+    double S=al.width;
+    if (on) { if (xxri_theme_dark()) cairo_set_source_rgb(cr,0.271,0.275,0.314);   /* @xxri_pop */
+              else cairo_set_source_rgba(cr,1,1,1,0.95);
+              rr_path(cr,2,2,al.width-4,al.height-4,13);
+              cairo_fill(cr); }
+    cairo_save(cr);
+    cairo_translate(cr,(al.width-S)/2,(al.height-S)/2);
+    draw_glyph(cr,rb->glyph,S,on);
+    cairo_restore(cr);
+    /* keyboard focus only: a mouse click must not leave a ring behind */
+    if (rb->ev && gtk_widget_has_visible_focus(rb->ev)) {
+        rr_path(cr,2,2,al.width-4,al.height-4,13);
+        if (xxri_theme_dark()) cairo_set_source_rgb(cr,0.298,0.576,0.973);
+        else cairo_set_source_rgb(cr,0.180,0.486,0.965);
+        cairo_set_line_width(cr,2); cairo_stroke(cr);
+    }
+    /* dot when updates are waiting */
+    if (!strcmp(rb->id,"updates") && g_updates && g_hash_table_size(g_updates)) {
+        cairo_set_source_rgb(cr,0.941,0.416,0.557);
+        cairo_arc(cr,al.width-11,11,3.6,0,2*G_PI); cairo_fill(cr);
+    }
+    return FALSE;
+}
+static void rail_go(RailBtn* rb) {
+    if (g_page && !strcmp(g_page,rb->id)) return;   /* already there: nothing to rebuild or fetch */
+    open_page(rb->id);
+}
+static gboolean on_rail_click(GtkWidget* w,GdkEventButton* e,gpointer u){ (void)w;
+    if (e->type!=GDK_BUTTON_PRESS || e->button!=1) return FALSE;
+    RailBtn* rb=u;
+    gtk_widget_grab_focus(rb->ev);    /* Tab and Enter carry on from here */
+    rail_go(rb);
+    return TRUE;
+}
+static gboolean on_rail_key(GtkWidget* w,GdkEventKey* e,gpointer u){ (void)w;
+    switch (e->keyval) {
+    case GDK_KEY_Return: case GDK_KEY_KP_Enter: case GDK_KEY_ISO_Enter: case GDK_KEY_space:
+        rail_go(u); return TRUE;
+    }
+    return FALSE;
+}
+static gboolean on_rail_focus(GtkWidget* w,GdkEventFocus* e,gpointer u){ (void)w;(void)e;
+    gtk_widget_queue_draw(gtk_bin_get_child(GTK_BIN(((RailBtn*)u)->ev)));   /* the ring is drawn by the glyph */
+    return FALSE;
+}
+static GtkWidget* build_rail(void){
+    GtkWidget* rail=gtk_box_new(GTK_ORIENTATION_VERTICAL,6);
+    gtk_widget_set_size_request(rail,62,-1);
+    GtkWidget* logo=gtk_image_new();
+    GdkPixbuf* lp=load_png("/usr/local/share/xxri-settings/icons/logo-36.png",30,30);
+    if (lp) { gtk_image_set_from_pixbuf(GTK_IMAGE(logo),lp); g_object_unref(lp); }
+    gtk_widget_set_margin_top(logo,14); gtk_widget_set_margin_bottom(logo,8);
+    gtk_box_pack_start(GTK_BOX(rail),logo,FALSE,FALSE,0);
+    for (int i=0;i<(int)G_N_ELEMENTS(RAIL);i++) {
+        RailBtn* rb=g_new0(RailBtn,1); rb->glyph=RAIL[i].glyph; rb->id=RAIL[i].id;
+        GtkWidget* da=gtk_drawing_area_new();
+        gtk_widget_set_size_request(da,44,44);
+        g_signal_connect(da,"draw",G_CALLBACK(draw_rail_btn),rb);
+        GtkWidget* ev=gtk_event_box_new();
+        gtk_event_box_set_visible_window(GTK_EVENT_BOX(ev),FALSE);
+        /* the drawing area's own GdkWindow would swallow the click otherwise */
+        gtk_event_box_set_above_child(GTK_EVENT_BOX(ev),TRUE);
+        gtk_widget_add_events(ev,GDK_BUTTON_PRESS_MASK|GDK_KEY_PRESS_MASK|GDK_FOCUS_CHANGE_MASK);
+        gtk_widget_set_can_focus(ev,TRUE);
+        rb->ev=ev;
+        gtk_container_add(GTK_CONTAINER(ev),da);
+        g_signal_connect(ev,"button-press-event",G_CALLBACK(on_rail_click),rb);
+        g_signal_connect(ev,"key-press-event",G_CALLBACK(on_rail_key),rb);
+        g_signal_connect(ev,"focus-in-event",G_CALLBACK(on_rail_focus),rb);
+        g_signal_connect(ev,"focus-out-event",G_CALLBACK(on_rail_focus),rb);
+        gtk_widget_set_tooltip_text(ev,_(RAIL[i].label));
+        { AtkObject* ao=gtk_widget_get_accessible(ev);
+          atk_object_set_name(ao,_(RAIL[i].label)); atk_object_set_role(ao,ATK_ROLE_PUSH_BUTTON); }
+        gtk_widget_set_halign(ev,GTK_ALIGN_CENTER);
+        gtk_box_pack_start(GTK_BOX(rail),ev,FALSE,FALSE,0);
+    }
+    return rail;
+}
+
+static void on_search_changed(GtkWidget* w,gpointer u){ (void)w;(void)u;
+    if (!g_page || strcmp(g_page,"search")) open_page("search");
+    else do_search();
+    gtk_widget_grab_focus(g_search_entry);
+    gtk_editable_set_position(GTK_EDITABLE(g_search_entry),-1);
+}
+static void update_status_chip(void){
+    if (!g_status_chip) return;
+    char t[200], tip[420];
+    gboolean bundled = g_repo_kind && !strcmp(g_repo_kind,"bundled");
+    /* ~40 chars fit at 1024px: short text on the chip, details in the tooltip */
+    if (!g_repo_available) {
+        g_strlcpy(t,_("Repository unavailable"),sizeof t);
+        if (g_repo_error && *g_repo_error && strcmp(g_repo_error,"no-catalog"))
+            snprintf(tip,sizeof tip,_("The %s catalog cannot be used: %s.\nArchitecture: %s"),
+                     g_arch, why_text(g_repo_error), g_arch);
+        else
+            snprintf(tip,sizeof tip,_("Could not reach repo.xxri.flows.best, and no catalog is cached.\nArchitecture: %s"), g_arch);
+    } else if (g_repo_offline) {
+        g_strlcpy(t,bundled ? _("Offline \xc2\xb7 bundled catalog") : _("Offline \xc2\xb7 cached catalog"),sizeof t);
+        snprintf(tip,sizeof tip,bundled ? _("Could not reach repo.xxri.flows.best; showing the catalog that came with this system%s%s.\nArchitecture: %s")
+                                        : _("Could not reach repo.xxri.flows.best; showing the catalog cached%s%s.\nArchitecture: %s"),
+                 (g_repo_updated&&*g_repo_updated)?_(" on "):"",
+                 (g_repo_updated&&*g_repo_updated)?g_repo_updated:"",
+                 g_arch);
+    } else {
+        g_strlcpy(t,_("Online \xc2\xb7 repo.xxri.flows.best"),sizeof t);
+        snprintf(tip,sizeof tip,_("Catalog last updated%s%s.\nArchitecture: %s"),
+                 (g_repo_updated&&*g_repo_updated)?" ":_(" \xe2\x80\x94 unknown"),
+                 (g_repo_updated&&*g_repo_updated)?g_repo_updated:"",
+                 g_arch);
+    }
+    /* the last refresh was thrown away, though a catalog is still in use */
+    if (g_repo_available && g_repo_error && *g_repo_error) {
+        char more[200]; snprintf(more,sizeof more,_("\nThe last update was not used: %s."), why_text(g_repo_error));
+        g_strlcat(tip,more,sizeof tip);
+    }
+    if (g_repo_error && *g_repo_error) {
+        char code[120]; snprintf(code,sizeof code,"\n(%s)", g_repo_error);
+        g_strlcat(tip,code,sizeof tip);
+    }
+    gtk_label_set_text(GTK_LABEL(g_status_chip),t);
+    gtk_widget_set_tooltip_text(g_status_chip,tip);
+    GtkStyleContext* sc=gtk_widget_get_style_context(g_status_chip);
+    if (g_repo_available && !g_repo_offline) gtk_style_context_remove_class(sc,"off");
+    else gtk_style_context_add_class(sc,"off");
+}
+
+/* startup: check connectivity + refresh the repository, without blocking */
+static gboolean poll_startup(gpointer u){ (void)u;
+    static int tries=0;
+    char sp[512],dp[512];
+    snprintf(sp,sizeof sp,"%s/status.json",g_cache);
+    snprintf(dp,sizeof dp,"%s/startup.done",g_cache);
+    char* doc=NULL; gsize len;
+    if (g_file_get_contents(sp,&doc,&len,NULL)) {
+        char* on=jget(doc,"online"); char* rk=jget(doc,"repo"); char* er=jget(doc,"error");
+        g_online=!strcmp(on,"true");
+        g_free(g_repo_kind); g_repo_kind=rk;
+        g_repo_offline = *rk && strcmp(rk,"remote")!=0; /* cached, or the copy bundled with the image */
+        g_free(g_repo_error); g_repo_error=er;
+        g_free(on); g_free(doc);
+        update_status_chip();
+    }
+    if (g_file_test(dp,G_FILE_TEST_EXISTS)) {
+        g_unlink(dp);
+        dbg("REFRESH_DONE marker seen after %d polls", tries);
+        char rl[512]; snprintf(rl,sizeof rl,"%s/refresh.log",g_cache);
+        char* log=NULL;
+        /* cmd_refresh: updated | unchanged | offline-cached leave a usable
+           catalog; rejected:<why>, unavailable and invalid:<why> do not */
+        gboolean got = g_file_get_contents(rl,&log,&len,NULL) && log &&
+                       (strstr(log,"updated") || strstr(log,"unchanged") ||
+                        strstr(log,"offline-cached"));
+        g_free(log);
+        /* started without any catalog (fresh install): reload if one exists now */
+        if (!got && !g_repo_available) {
+            char* cp = run_cmd("xxri-store catalog-path");
+            got = g_file_test(cp,G_FILE_TEST_EXISTS);
+            g_free(cp);
+        }
+        dbg("REFRESH_GOT=%d", got);
+        if (got) {          /* a catalog arrived or changed */
+            load_catalog(); rebuild(g_page); load_installed_async();
+            dbg("RELOADED apps=%u available=%d", g_apps?g_apps->len:0, g_repo_available);
+        } else if (g_online) {
+            kick_icon_fetch();
+        }
+        update_status_chip();
+        tries=0; return G_SOURCE_REMOVE;
+    }
+    if (++tries>40) { tries=0; return G_SOURCE_REMOVE; }
+    return G_SOURCE_CONTINUE;
+}
+static void kick_startup(void){
+    char cmd[1024];
+    snprintf(cmd,sizeof cmd,
+        "xxri-store refresh > '%s/refresh.log' 2>&1; "
+        "xxri-store status > '%s/status.json' 2>/dev/null; "
+        "touch '%s/startup.done'",
+        g_cache,g_cache,g_cache);
+    dbg("REFRESH_STARTED cmd=%s", cmd);
+    run_bg("%s",cmd);
+    g_timeout_add(700,poll_startup,NULL);
+}
+static void on_toggle_incompat(GtkWidget* w,gpointer u){ (void)u;
+    g_show_incompat = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(w));
+    rebuild(g_page);        /* re-render the current page with the new filter */
+}
+static void on_refresh_click(GtkWidget* w,gpointer u){ (void)w;(void)u;
+    char cmd[1024];
+    snprintf(cmd,sizeof cmd,
+        "xxri-store refresh --force > '%s/refresh.log' 2>&1; "
+        "xxri-store status > '%s/status.json' 2>/dev/null; "
+        "touch '%s/startup.done'",
+        g_cache,g_cache,g_cache);
+    run_bg("%s",cmd);
+    g_timeout_add(700,poll_startup,NULL);
+}
+
+static void activate(GtkApplication* app,gpointer u){ (void)u;
+    GtkCssProvider* prov=gtk_css_provider_new();
+    gtk_css_provider_load_from_path(prov,STORE_DIR "/xxri-store.css",NULL);
+    gtk_style_context_add_provider_for_screen(gdk_screen_get_default(),
+        GTK_STYLE_PROVIDER(prov),GTK_STYLE_PROVIDER_PRIORITY_APPLICATION+1);
+    /* Light or Dark as in Settings, switching while open; the rail and the
+       tile glyphs are cairo, so they repaint */
+    xxri_theme_init(STORE_DIR "/xxri-store-dark.css",
+        +[](gboolean dark, gpointer d){ (void)dark;(void)d; if (g_win) gtk_widget_queue_draw(g_win); }, NULL);
+    xxri_dialogs_init();
+
+    g_cache=run_cmd("xxri-store cache-path");
+    if (!*g_cache) { g_free(g_cache); g_cache=g_strdup_printf("%s/.cache/xxri-store",g_get_home_dir()); }
+    g_history=g_ptr_array_new();
+    load_catalog();
+    apply_installed("","","");     /* empty until the worker thread has the real state */
+
+    g_win=gtk_application_window_new(app);
+    gtk_window_set_title(GTK_WINDOW(g_win),"XXRI Store");
+    /* fit the smallest supported panel, grow into anything larger */
+    GdkRectangle wa; GdkMonitor* m=gdk_display_get_primary_monitor(gdk_display_get_default());
+    if (m) gdk_monitor_get_workarea(m,&wa); else { wa.width=1024; wa.height=768; }
+    int W=wa.width-80, H=wa.height-120;
+    if (W>1080) W=1080; if (W<820) W=820;
+    if (H>720) H=720;  if (H<560) H=560;
+    gtk_window_set_default_size(GTK_WINDOW(g_win),W,H);
+    css(g_win,"xxri-root");
+    /* Real alpha when the XXRI compositor is running - see the matching block
+       in xxri-settings.  Without a compositor nothing changes. */
+    {
+        GdkScreen* sc0 = gtk_widget_get_screen(g_win);
+        GdkVisual* rgba = gdk_screen_get_rgba_visual(sc0);
+        if (rgba && gdk_screen_is_composited(sc0)) {
+            gtk_widget_set_visual(g_win, rgba);
+            css(g_win, "composited");
+        }
+    }
+
+    GtkWidget* hb=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,0);
+    /* not the Settings layout on purpose: narrow icon rail with the window
+       controls on top, header with wordmark and search beside it (mockup) */
+    XxriChrome* chrome = xxri_chrome_new(g_win);
+    GtkWidget* railcol = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    css(railcol, "xxri-rail-col");
+    GtkWidget* crow = gtk_event_box_new();
+    gtk_event_box_set_visible_window(GTK_EVENT_BOX(crow), TRUE);
+    css(crow, "xxri-chrome-row");
+    gtk_container_add(GTK_CONTAINER(crow), xxri_chrome_controls(chrome));
+    xxri_chrome_drag_area(chrome, crow);
+    gtk_box_pack_start(GTK_BOX(railcol), crow, FALSE, FALSE, 0);
+    g_rail=build_rail();
+    gtk_box_pack_start(GTK_BOX(railcol), g_rail, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(hb), railcol, FALSE, FALSE, 0);
+
+    GtkWidget* right=gtk_box_new(GTK_ORIENTATION_VERTICAL,0);
+    gtk_box_pack_start(GTK_BOX(hb),right,TRUE,TRUE,0);
+
+    /* header: back, wordmark, search, refresh, status chip */
+    GtkWidget* headbox=gtk_event_box_new();
+    gtk_event_box_set_visible_window(GTK_EVENT_BOX(headbox),TRUE);
+    /* drag handle; opaque toolbar, only the rail is translucent */
+    css(headbox,"xxri-headbox");
+    xxri_chrome_drag_area(chrome, headbox);
+    GtkWidget* head=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,10);
+    css(head,"xxri-header");
+    gtk_container_add(GTK_CONTAINER(headbox),head);
+    GtkWidget* back=gtk_button_new_with_label("\xe2\x80\xb9");
+    css(back,"xxri-backbtn");
+    gtk_widget_set_valign(back,GTK_ALIGN_CENTER);
+    g_signal_connect(back,"clicked",G_CALLBACK(go_back),NULL);
+    gtk_box_pack_start(GTK_BOX(head),back,FALSE,FALSE,0);
+    gtk_box_pack_start(GTK_BOX(head),lbl("XXRI Store","xxri-wordmark",0),FALSE,FALSE,0);
+
+    GtkWidget* sb=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,0);
+    css(sb,"xxri-searchbar");
+    g_search_entry=gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(g_search_entry),_("Search apps, categories, publishers\xe2\x80\xa6"));
+    /* minimum only, it still expands; 34 made the window wider than 1024px */
+    gtk_entry_set_width_chars(GTK_ENTRY(g_search_entry),16);
+    /* cairo magnifier: no icon theme here, and a themed icon name makes GTK
+     * abort when even its fallback icon can't be loaded */
+    {
+        cairo_surface_t* ms=cairo_image_surface_create(CAIRO_FORMAT_ARGB32,18,18);
+        cairo_t* mc=cairo_create(ms);
+        cairo_set_source_rgba(mc,0.42,0.42,0.45,0.9); cairo_set_line_width(mc,1.6);
+        cairo_arc(mc,7.5,7.5,4.5,0,2*G_PI); cairo_stroke(mc);
+        cairo_move_to(mc,11,11); cairo_line_to(mc,15.5,15.5); cairo_stroke(mc);
+        cairo_destroy(mc);
+        GdkPixbuf* mp=gdk_pixbuf_get_from_surface(ms,0,0,18,18);
+        cairo_surface_destroy(ms);
+        if (mp) { gtk_entry_set_icon_from_pixbuf(GTK_ENTRY(g_search_entry),GTK_ENTRY_ICON_PRIMARY,mp); g_object_unref(mp); }
+    }
+    g_signal_connect(g_search_entry,"changed",G_CALLBACK(on_search_changed),NULL);
+    gtk_box_pack_start(GTK_BOX(sb),g_search_entry,TRUE,TRUE,0);
+    gtk_widget_set_valign(sb,GTK_ALIGN_CENTER);
+    gtk_box_pack_end(GTK_BOX(head),sb,TRUE,TRUE,0);
+
+    g_status_chip=lbl("","xxri-statuschip",0.5);
+    gtk_label_set_ellipsize(GTK_LABEL(g_status_chip),PANGO_ELLIPSIZE_END);
+    gtk_label_set_max_width_chars(GTK_LABEL(g_status_chip),30);
+    gtk_widget_set_valign(g_status_chip,GTK_ALIGN_CENTER);
+    gtk_box_pack_end(GTK_BOX(head),g_status_chip,FALSE,FALSE,0);
+    GtkWidget* rf=gtk_button_new_with_label(_("Refresh"));
+    css(rf,"xxri-chip");
+    gtk_widget_set_valign(rf,GTK_ALIGN_CENTER);
+    g_signal_connect(rf,"clicked",G_CALLBACK(on_refresh_click),NULL);
+    gtk_box_pack_end(GTK_BOX(head),rf,FALSE,FALSE,0);
+    /* architecture filter: OFF by default -> only apps this device can run */
+    GtkWidget* si=gtk_toggle_button_new_with_label(_("Show all architectures"));
+    css(si,"xxri-chip");
+    gtk_widget_set_valign(si,GTK_ALIGN_CENTER);
+    gtk_widget_set_tooltip_text(si,_("Also show apps built for other CPUs (they can't be installed here)"));
+    g_signal_connect(si,"toggled",G_CALLBACK(on_toggle_incompat),NULL);
+    gtk_box_pack_end(GTK_BOX(head),si,FALSE,FALSE,0);
+    gtk_box_pack_start(GTK_BOX(right),headbox,FALSE,FALSE,0);
+
+    g_stack=gtk_stack_new();
+    gtk_stack_set_transition_type(GTK_STACK(g_stack),GTK_STACK_TRANSITION_TYPE_CROSSFADE);
+    gtk_stack_set_transition_duration(GTK_STACK(g_stack),140);
+    gtk_box_pack_start(GTK_BOX(right),g_stack,TRUE,TRUE,0);
+
+    gtk_container_add(GTK_CONTAINER(g_win), xxri_chrome_resizable(chrome, hb));
+
+    update_status_chip();
+    gtk_widget_show_all(g_win);
+    rebuild("home");
+    kick_startup();
+    g_live_sig = live_signature();          /* baseline; poll for live changes */
+    load_installed_async();                 /* installed apps, updates, downloads: off the GTK thread */
+    g_timeout_add(1500, poll_live, NULL);
+}
+
+int main(int argc,char** argv){
+    xxri_i18n_init();
+    /* --dump <id>: the catalog entry as parsed, icon resolution and the action
+       the UI would build, no X needed. --click also runs the install handler. */
+    if (argc>2 && (!strcmp(argv[1],"--dump") || !strcmp(argv[1],"--click"))) {
+        gboolean click = !strcmp(argv[1],"--click");
+        gtk_init_check(&argc,&argv);          /* works headless too */
+        g_cache = run_cmd("xxri-store cache-path");
+        dbg("STARTUP pid=%d HOME=%s PATH=%s CWD=%s DISPLAY=%s",
+            (int)getpid(), g_getenv("HOME"), g_getenv("PATH"),
+            g_get_current_dir(), g_getenv("DISPLAY"));
+        dbg("CACHE_PATH=%s", g_cache);
+        g_arch  = run_cmd("xxri-store arch-name");
+        if (!*g_arch) { g_free(g_arch); g_arch=g_strdup("i686"); }
+        load_catalog();
+        load_installed();
+        App* a = g_hash_table_lookup(g_byid, argv[2]);
+        if (!a) {
+            printf("PARSE: id '%s' NOT FOUND in the parsed catalog (%u apps loaded)\n",
+                   argv[2], g_apps?g_apps->len:0);
+            return 3;
+        }
+        printf("=== catalog entry as parsed by the GUI: %s ===\n", argv[2]);
+        printf("  id            : '%s'\n", a->id);
+        printf("  name          : '%s'\n", a->name);
+        printf("  category      : '%s'\n", a->category);
+        printf("  kind          : '%s'\n", a->kind);
+        printf("  source_type   : '%s'   (provider)\n", a->source_type);
+        printf("  source_ref    : '%s'   (package id)\n", a->source_ref);
+        printf("  version       : '%s'\n", a->version);
+        printf("  arch          : '%s'\n", a->arch);
+        printf("  size          : %lld\n", (long long)a->size);
+        printf("  sha256        : '%s'\n", a->sha256);
+        printf("  icon_url      : '%s'\n", a->icon_url);
+        printf("  homepage      : '%s'\n", a->homepage);
+        printf("  verified      : %d\n", a->verified);
+        printf("  unavailable   : '%s'\n", a->unavailable?a->unavailable:"");
+        printf("  desktop id    : 'xxri-app-%s.desktop'\n", a->id);
+        printf("\n=== derived state ===\n");
+        printf("  app_compatible : %d\n", app_compatible(a));
+        printf("  app_installable: %d\n", app_installable(a));
+        printf("  app_installed  : %d\n", app_installed(a));
+        printf("  app_visible    : %d\n", app_visible(a));
+        printf("  app_has_room   : %d   (free=%lld KB, needs=%lld KB)\n",
+               app_has_room(a), (long long)g_free_kb, (long long)app_space_kb(a));
+        printf("\n=== icon resolution ===\n");
+        gboolean real=FALSE;
+        GdkPixbuf* pb=app_icon(a,64,&real);
+        printf("  pixbuf         : %s\n", pb?"OK":"NULL");
+        printf("  from real file : %d  (0 = generated gradient tile)\n", real);
+        char ip[1024];
+        snprintf(ip,sizeof ip,"%s/%s.png",ICON_DIR,a->id);
+        printf("  bundled path   : %s  (exists=%d)\n", ip, g_file_test(ip,G_FILE_TEST_EXISTS));
+        printf("\n=== action the UI builds ===\n");
+        if (!gdk_display_get_default()) {
+            printf("  (no display: widget construction skipped)\n");
+            printf("  branch it WOULD take: %s\n",
+                app_updatable(a) ? "Update" :
+                app_installed(a) ? "Open" :
+                app_unavailable(a) ? "Currently unsupported" :
+                (app_compatible(a) && !a->verified) ? "Unavailable" :
+                !app_compatible(a) ? "Regular / Pro" :
+                !app_has_room(a) ? "Not enough disk space" : "INSTALL");
+        } else {
+            GtkWidget* b=action_button(a,TRUE);
+            const char* label = GTK_IS_BUTTON(b)?gtk_button_get_label(GTK_BUTTON(b)):"(not a button)";
+            printf("  button label   : '%s'\n", label);
+            printf("  sensitive      : %d\n", gtk_widget_get_sensitive(b));
+            guint sig=g_signal_lookup("clicked",GTK_TYPE_BUTTON);
+            printf("  install handler attached: %lu\n",
+                   (unsigned long)g_signal_handler_find(G_OBJECT(b),G_SIGNAL_MATCH_FUNC,
+                                                        sig,0,NULL,(gpointer)act_install,NULL));
+        }
+        if (click) {
+            printf("\n=== simulating the click (exact handler body) ===\n");
+            fflush(stdout);
+            act_install(NULL,a);
+            printf("  handler returned\n");
+            g_usleep(3*1000*1000);
+        }
+        return 0;
+    }
+    /* deep link: `xxri-store-gui <page>` (dock, help and QA use it) */
+    const char* start = argc>1 ? argv[1] : NULL;
+    GtkApplication* app=gtk_application_new("best.flows.xxri.store",G_APPLICATION_NON_UNIQUE);
+    g_signal_connect(app,"activate",G_CALLBACK(activate),NULL);
+    if (start) {
+        g_signal_connect_data(app,"activate",G_CALLBACK(+[](GtkApplication* a,gpointer d){ (void)a;
+            open_page((const char*)d); }),(gpointer)start,NULL,G_CONNECT_AFTER);
+    }
+    int s=g_application_run(G_APPLICATION(app),1,argv);
+    g_object_unref(app);
+    return s;
+}

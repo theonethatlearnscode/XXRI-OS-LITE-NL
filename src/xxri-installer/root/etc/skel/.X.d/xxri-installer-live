@@ -1,0 +1,5 @@
+# Start the installer on live/RAM sessions only (an installed system drops
+# this hook and the installer anyway, see install2disk / xxri-hw-init).
+case "$(awk '$2=="/"{print $3; exit}' /proc/mounts)" in
+	rootfs|tmpfs) [ -x /usr/local/bin/xxri-installer ] && xxri-installer & ;;
+esac

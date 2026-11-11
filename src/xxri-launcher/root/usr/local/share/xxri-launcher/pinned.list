@@ -1,0 +1,16 @@
+# pinned.list - the dock's pinned applications, one .desktop id (the filename
+# without ".desktop") per line, in dock order, maximum 8.
+#
+# xxri-dock-pin owns it and rebuilds /usr/local/tce.icons from it (plus
+# dot.wbar's header triple) on every change and at boot. While the desktop
+# runs, use `xxri-dock-pin pin|unpin <id>` instead of editing it.
+#
+# The entries below are the default dock.
+xxri-store
+xxri-settings
+xxri-file
+aterm
+xxri-browser
+xxri-media
+xxri-editor
+xxri-power

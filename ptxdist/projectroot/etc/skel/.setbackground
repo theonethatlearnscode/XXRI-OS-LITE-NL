@@ -1,0 +1,4 @@
+#!/bin/sh
+# xxri OS Lite wallpaper: whatever Settings > Wallpaper & Style saved, or the
+# official default (usr/local/share/xxri-theme/wallpapers/official.list).
+exec /usr/local/bin/xxri-desktop wallpaper apply

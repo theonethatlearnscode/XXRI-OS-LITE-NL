@@ -1,0 +1,12 @@
+# xxri OS Lite dock: wbar's options triple only. The launchers come from
+# xxri-launcher/pinned.list; xxri-dock-pin takes this first i:/t:/c: triple
+# and appends one per pinned app.
+#
+# Keep "i: ", "t: ", "c: " out of comment line starts: write_dock() matches
+# lines by pattern.
+#
+# -zoomf 1.06: a bigger zoom slides icons out from under the pointer (and off
+# their running dots), but 1.0 with -nanim 0 makes wbar ignore every click.
+i: /usr/local/share/xxri-theme/wbar-bg.png
+t: /usr/local/lib/X11/fonts/TTF/luxisr/9
+c: wbar -bpress -nofont -pos bottom -offset 15 -isize 40 -idist 7 -zoomf 1.06 -nanim 3 -jumpf 0.0

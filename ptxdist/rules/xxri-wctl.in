@@ -1,0 +1,9 @@
+## SECTION=project_specific
+
+config XXRI_WCTL
+	bool
+	select XXRI_TC_SYSROOT
+	prompt "xxri-wctl: window control helper"
+	help
+	  Small X11 tool the dock and shell scripts use to list and raise windows;
+	  also the dock's running indicators and right-click menu.

@@ -1,0 +1,1112 @@
+#!/bin/busybox ash
+# xxri-store - repository / download engine for the XXRI Store.
+#
+# xxri-store-gui is only the GTK front-end; catalog, network and downloads
+# live here. The catalog is the repository's file for this OS's architecture
+# (i686.json or x64.json, see store-arch.sh), cached for offline use; downloads
+# are verified and handed to xxri-app, which does the installing.
+#
+# Subcommands:
+#   arch                      current OS architecture and its catalog (flat JSON)
+#   status                    online/repo/arch/catalog/refreshed in one JSON
+#   catalog-path              the catalog file in use (cache or bundled copy)
+#   online                    exit 0 if the network is reachable
+#   repo-path                 path of the active repository directory
+#   refresh [--force]         fetch the remote repository into the cache
+#   resolve <id>              print "URL<TAB>SHA256<TAB>VERSION<TAB>SIZE"
+#   install <id>              queue -> download -> verify -> xxri-app integrate
+#   pause <id> | resume <id>  pause / continue a download (wget -c)
+#   retry <id>                restart a failed download
+#   cancel <id>               cancel and remove a queued or running download
+#   clear [<id>]              drop finished entries (or one) from the manager
+#   downloads                 download-manager state (flat JSON)
+#   installed                 installed apps joined with the catalog (flat JSON)
+#   updates                   apps with a newer catalog version (flat JSON)
+#   update-all                install every available update, one by one
+#   open-location <id>        open the folder of an installed app
+#   cache-path                path of the per-user cache (icons, shots, queue)
+#   icons <id>...             cache the catalog icons for these apps
+#   shots <id>                cache the screenshots for one app
+#   field <id> <key>          one catalog field for <id> (from index.tsv)
+
+BUNDLED=/usr/local/share/xxri-store
+CONF=/usr/local/etc/xxri/store.conf
+[ -r "$CONF" ] && . "$CONF"
+. /usr/local/lib/xxri/store-arch.sh
+detect_os_arch    # unknown arch: no catalog name, and the catalog commands say so
+: "${REMOTE_BASE:=https://repo.xxri.flows.best}"      # repository root (icons resolve against it)
+# the ONLY catalog source: this architecture's file, never the other one's
+[ -n "$REPO_URL" ] || { [ -z "$CATALOG_NAME" ] || REPO_URL="$REMOTE_BASE/$CATALOG_NAME"; }
+: "${CACHE_MAX_AGE:=86400}"                          # seconds before a refresh is due
+: "${TCZ_BASE:=http://repo.tinycorelinux.net/16.x/${TC_ARCH:-unknown}/tcz}"  # native extension repo
+
+# .tcz progress = this dir growing (tce-load does the transfer)
+TCE_OPT="$(readlink -f /etc/sysconfig/tcedir 2>/dev/null)/optional"
+[ -d "$TCE_OPT" ] || TCE_OPT=/tmp/tce/optional
+
+# no getent in busybox; the Store runs as the desktop user anyway
+user_home() {
+	[ -n "$HOME" ] && [ -d "$HOME" ] && { echo "$HOME"; return; }
+	h=$(awk -F: -v u="$(id -un)" '$1==u{print $6; exit}' /etc/passwd 2>/dev/null)
+	echo "${h:-/root}"
+}
+HOMEDIR="$(user_home)"
+CACHE="$HOMEDIR/.cache/xxri-store"
+DL_DIR="$HOMEDIR/Downloads"
+DL_STATE="$CACHE/downloads"                          # one file per download: KEY=val
+LOCK="$CACHE/install.lock"                           # one install at a time
+mkdir -p "$CACHE/repository" "$DL_STATE" "$DL_DIR" 2>/dev/null
+
+# trace
+# one line per install stage: the last ok line shows where it broke
+TRACE="$CACHE/install-trace.log"
+trace() { # stage [detail]
+	printf '%s %-9s %-20s %s\n' "$(date '+%H:%M:%S')" "${TRACE_ID:--}" "$1" "$2" >> "$TRACE" 2>/dev/null
+	[ -n "$XXRI_STORE_TRACE" ] && printf '  TRACE %-20s %s\n' "$1" "$2" >&2
+	return 0
+}
+
+# repo select
+# One catalog per architecture, cached under its own name (i686.json, x64.json)
+# so a cache is never read as the other architecture's. The image may carry a
+# copy of its catalog for the first run offline; the one with the newer
+# last_updated is active (the cached one on a tie).
+CATALOG_CACHE="$CACHE/${CATALOG_NAME:-no-arch.json}"
+CATALOG_META="${CATALOG_CACHE%.json}.meta"   # ETag / Last-Modified of the cached copy
+CATALOG_BUNDLED="$BUNDLED/${CATALOG_NAME:-no-arch.json}"
+DIAG="$CACHE/catalog.diag"               # why the last refresh was not used
+repo_path() { echo "$CACHE"; }
+_stamp() { sed -n 's/.*"last_updated"[ ]*:[ ]*"\([^"]*\)".*/\1/p' "$1" 2>/dev/null | head -1 | tr -cd '0-9'; }
+pick_catalog() {
+	CATALOG="$CATALOG_CACHE"
+	[ -s "$CATALOG_BUNDLED" ] || return 0
+	[ -s "$CATALOG_CACHE" ] && [ "$(_stamp "$CATALOG_CACHE")0" -ge "$(_stamp "$CATALOG_BUNDLED")0" ] && return 0
+	CATALOG="$CATALOG_BUNDLED"
+}
+pick_catalog
+have_catalog() { [ -s "$CATALOG" ]; }
+
+# reading the remote schema
+# One application object per line. Tracks depth (and strings/escapes)
+# instead of splitting on "},{", which broke on the nested "sources" objects.
+_objs() {
+	awk '
+	function scan(line,   i, c, out) {
+		out = ""
+		for (i = 1; i <= length(line); i++) {
+			c = substr(line, i, 1)
+			if (instr) {
+				if (c == "\\") { i++; continue }
+				if (c == "\"") instr = 0
+				continue
+			}
+			if (c == "\"") { instr = 1; continue }
+			if (c == "[" || c == "{") depth++
+			if (c == "]" || c == "}") depth--
+		}
+		return out
+	}
+	!inarr {
+		if ($0 ~ /"applications"[ \t]*:[ \t]*\[/) { inarr = 1; depth = 0; scan($0); base = depth }
+		next
+	}
+	{
+		before = depth
+		scan($0)
+		if (!collecting && before == base && depth > base) { collecting = 1; buf = $0; next }
+		if (collecting) {
+			buf = buf " " $0
+			if (depth == base) { gsub(/[ \t]+/, " ", buf); print buf; collecting = 0; buf = "" }
+		}
+	}' "${1:-$CATALOG}"
+}
+
+# one field of one application, by key name
+japp() { # id key -> value ("" when absent)
+	[ -s "$CATALOG" ] || return 0
+	_objs | awk -v want="$1" -v key="$2" '
+		{
+			if (!match($0, "\"id\"[ \t]*:[ \t]*\"" want "\"")) next
+			# depth 1 only: nested objects reuse key names
+			depth = 0; instr = 0; n = length($0); i = 1
+			while (i <= n) {
+				c = substr($0, i, 1)
+				if (instr) {
+					if (c == "\\") { i += 2; continue }
+					if (c == "\"") instr = 0
+					i++; continue
+				}
+				if (c == "\"") {
+					if (depth == 1) {
+						rest = substr($0, i)
+						if (match(rest, "^\"" key "\"[ \t]*:[ \t]*")) {
+							val = substr(rest, RLENGTH + 1)
+							if (substr(val, 1, 1) == "\"") {
+								val = substr(val, 2); out = ""
+								for (j = 1; j <= length(val); j++) {
+									d = substr(val, j, 1)
+									if (d == "\\") { j++; e = substr(val, j, 1)
+										if (e == "n") out = out "\n"; else out = out e
+										continue }
+									if (d == "\"") break
+									out = out d
+								}
+								print out
+							} else if (substr(val, 1, 1) == "{" || substr(val, 1, 1) == "[") {
+								print ""            # structured value: not a scalar
+							} else {
+								# ] first in the set: busybox awk (POSIX) reads \] as a
+								# backslash and a closing bracket, so a number or true/null
+								# never matched and `size` came back empty (no progress total)
+								match(val, /^[^],}]+/)
+								v = substr(val, RSTART, RLENGTH); gsub(/[ \t\r]+$/, "", v)
+								print v
+							}
+							exit
+						}
+					}
+					instr = 1; i++; continue
+				}
+				if (c == "{" || c == "[") depth++
+				if (c == "}" || c == "]") depth--
+				i++
+			}
+			exit
+		}'
+}
+
+
+# A small per-catalog index (id, title, version, size), built in ONE pass.
+# installed/updates used to look every installed app up with japp(), and each
+# lookup scanned the whole catalog (~0.06 s here, 14 of them per app: the
+# Store's poll made its window freeze). Now: one scan per catalog change, then
+# a grep-sized file. Row: id <TAB> title <TAB> version-or-upstream <TAB> size.
+IDX="$CACHE/${CATALOG_NAME:-no-arch.json}.idx"
+_idx_tag() { printf '#%s %s' "$CATALOG" "$(wc -c < "$CATALOG" 2>/dev/null | tr -d ' ')"; }
+_mkindex() {
+	_objs | awk '
+	function d1(line, key,   depth, instr, n, i, c, rest, val, out, j, d, e, v) {
+		depth = 0; instr = 0; n = length(line); i = 1
+		while (i <= n) {
+			c = substr(line, i, 1)
+			if (instr) {
+				if (c == "\\") { i += 2; continue }
+				if (c == "\"") instr = 0
+				i++; continue
+			}
+			if (c == "\"") {
+				if (depth == 1) {
+					rest = substr(line, i)
+					if (match(rest, "^\"" key "\"[ \t]*:[ \t]*")) {
+						val = substr(rest, RLENGTH + 1)
+						if (substr(val, 1, 1) == "\"") {
+							val = substr(val, 2); out = ""
+							for (j = 1; j <= length(val); j++) {
+								d = substr(val, j, 1)
+								if (d == "\\") { j++; e = substr(val, j, 1); out = out e; continue }
+								if (d == "\"") break
+								out = out d
+							}
+							return out
+						}
+						if (substr(val, 1, 1) == "{" || substr(val, 1, 1) == "[") return ""
+						match(val, /^[^],}]+/)
+						v = substr(val, RSTART, RLENGTH); gsub(/[ \t\r]+$/, "", v)
+						return v
+					}
+				}
+				instr = 1; i++; continue
+			}
+			if (c == "{" || c == "[") depth++
+			if (c == "}" || c == "]") depth--
+			i++
+		}
+		return ""
+	}
+	{
+		id = d1($0, "id"); if (id == "") next
+		v = d1($0, "version"); if (v == "") v = d1($0, "current_upstream_version")
+		sz = d1($0, "size"); if (sz !~ /^[0-9]+$/) sz = 0
+		gsub(/\t/, " ", id); t = d1($0, "title"); gsub(/\t/, " ", t); gsub(/\t/, " ", v)
+		print id "\t" t "\t" v "\t" sz
+	}'
+}
+# prints the index file path (rebuilt when the catalog in use changed)
+idx_file() {
+	[ -s "$CATALOG" ] || return 1
+	_t="$(_idx_tag)"
+	if [ "$(head -n 1 "$IDX" 2>/dev/null)" != "$_t" ]; then
+		{ echo "$_t"; _mkindex; } > "$IDX.$$" 2>/dev/null && mv "$IDX.$$" "$IDX" || { rm -f "$IDX.$$"; return 1; }
+	fi
+	echo "$IDX"
+}
+# id column(2 title, 3 version, 4 size) -> value
+idx_get() { # id col
+	_f="$(idx_file)" || return 0
+	awk -F'\t' -v id="$1" -v c="$2" 'NR > 1 && $1 == id { print $c; exit }' "$_f"
+}
+
+
+# network
+# busybox wget has no TLS here (no ssl_client), so use GNU wget + CA bundle
+GNUWGET=""
+for w in /usr/local/bin/wget /usr/bin/gnu-wget; do
+	[ -x "$w" ] && { GNUWGET="$w"; break; }
+done
+CABUNDLE=""
+for c in /usr/local/etc/ssl/certs/ca-certificates.crt /usr/local/etc/ssl/cacert.pem \
+         /usr/local/etc/ssl/ca-bundle.crt /etc/ssl/certs/ca-certificates.crt; do
+	[ -r "$c" ] && { CABUNDLE="$c"; break; }
+done
+
+fetch_to() { # url outfile [-c]   -> download to a file
+	if [ -n "$GNUWGET" ]; then
+		"$GNUWGET" -q $3 --timeout=60 --tries=2 ${CABUNDLE:+--ca-certificate="$CABUNDLE"} \
+			-U xxri-store -O "$2" "$1"
+	else
+		wget -q -T 60 $3 -O "$2" "$1"
+	fi
+}
+
+probe() { # url -> 0 when it answers (headers only, no body)
+	if [ -n "$GNUWGET" ]; then
+		"$GNUWGET" -q --spider --timeout=20 --tries=1 ${CABUNDLE:+--ca-certificate="$CABUNDLE"} \
+			-U xxri-store "$1"
+	else
+		wget -q --spider -T 20 -U xxri-store "$1"
+	fi
+}
+have_net() {
+	# a route doesn't mean the catalog answers: probe the catalog itself, but
+	# ask for the headers only (x64.json is 800 KB)
+	[ -n "$REPO_URL" ] || return 1
+	gw="$(route -n 2>/dev/null | awk '$1=="0.0.0.0"{print $2; exit}')"
+	[ -n "$gw" ] || return 1
+	probe "$REPO_URL"
+}
+
+# arch
+# "raw" is the kernel's uname -m, kept for diagnostics only: the OS's own
+# architecture is the userspace's (store-arch.sh), and it can differ
+cmd_arch() {
+	printf '{"arch":"%s","bits":%s,"machine":%s,"raw":"%s","catalog":"%s","probe":"%s"}\n' \
+		"${OS_ARCH:-unknown}" "$OS_BITS" "$OS_EMACH" "$(uname -m)" "$CATALOG_NAME" "$ARCH_PROBE"
+}
+this_arch() { echo "$OS_ARCH"; }
+cmd_catalog_path() { echo "$CATALOG"; }
+
+# catalog_check FILE -> 0 when it is a usable catalog of this OS's architecture.
+# Otherwise sets CK_WHY: unknown-arch, empty, html-page, not-json, truncated,
+# no-applications, no-entries, missing-arch:N or wrong-arch:<archs>. On success
+# sets CK_APPS, CK_SCHEMA and CK_UPDATED. Call it directly, not in $(...), or
+# the results are lost in the subshell. Only entry-level keys count: each
+# "sources" object repeats "architecture" and must not be mistaken for an entry.
+catalog_check() {
+	CK_WHY=""; CK_APPS=0; CK_SCHEMA=""; CK_UPDATED=""
+	[ -n "$OS_ARCH" ] || { CK_WHY=unknown-arch; return 1; }
+	[ -s "$1" ] || { CK_WHY=empty; return 1; }
+	if head -c 600 "$1" | tr 'A-Z' 'a-z' | grep -q '<!doctype\|<html\|<head\|<body'; then
+		CK_WHY=html-page; return 1
+	fi
+	rep="$(awk -v want="$OS_ARCH" '
+	function str_at(   j, d) {            # the string starting at i; i ends on its closing quote
+		for (j = i + 1; j <= n; j++) {
+			d = substr($0, j, 1)
+			if (d == "\\") { j++; continue }
+			if (d == "\"") break
+		}
+		s = substr($0, i + 1, j - i - 1); i = j
+	}
+	{
+		n = length($0)
+		for (i = 1; i <= n; i++) {
+			c = substr($0, i, 1)
+			if (c == "\"") {
+				str_at()
+				if (substr($0, i + 1) ~ /^ *:/) { key = s; kd = depth }
+				else {
+					if (key == "architecture" && kd == 3) { have++; if (s != want) bad[s] = 1 }
+					if (key == "schema_version" && kd == 1) schema = s
+					if (key == "last_updated" && kd == 1) updated = s
+					key = ""
+				}
+			} else if (c == "{" || c == "[") {
+				if (c == "[" && key == "applications" && kd == 1) { inapps = 1; seen = 1 }
+				else if (c == "{" && inapps && depth == 2) apps++
+				stack[++depth] = c; key = ""; started = 1
+			} else if (c == "}" || c == "]") {
+				if (depth < 1 || stack[depth] != (c == "}" ? "{" : "[")) broken = 1
+				if (c == "]" && inapps && depth == 2) inapps = 0
+				depth--; key = ""
+			}
+		}
+	}
+	END {
+		list = ""; for (a in bad) list = list (list == "" ? "" : ",") a
+		printf "%d|%d|%d|%d|%d|%s|%s|%s\n", started, (depth != 0 || broken), seen, apps, have, list, schema, updated
+	}' "$1")"
+	OLDIFS="$IFS"; IFS='|'; set -- $rep; IFS="$OLDIFS"
+	[ "$1" = 1 ] || { CK_WHY=not-json; return 1; }
+	[ "$2" = 0 ] || { CK_WHY=truncated; return 1; }
+	[ "$3" = 1 ] || { CK_WHY=no-applications; return 1; }
+	[ "$4" -gt 0 ] 2>/dev/null || { CK_WHY=no-entries; return 1; }
+	[ -z "$6" ] || { CK_WHY="wrong-arch:$6"; return 1; }
+	[ "$5" = "$4" ] || { CK_WHY="missing-arch:$(( $4 - $5 ))"; return 1; }
+	CK_APPS=$4; CK_SCHEMA=$7; CK_UPDATED=$8
+}
+
+# our busybox has no sha256sum, so openssl unless coreutils shows up
+sha256_of() { # file -> hex digest (empty on failure)
+	if command -v sha256sum >/dev/null 2>&1; then
+		sha256sum "$1" 2>/dev/null | cut -d' ' -f1
+	elif command -v openssl >/dev/null 2>&1; then
+		openssl dgst -sha256 "$1" 2>/dev/null | sed 's/.*[= ]//'
+	fi
+}
+have_sha256() { command -v sha256sum >/dev/null 2>&1 || command -v openssl >/dev/null 2>&1; }
+
+cmd_status() {
+	# online   : the repository answered (headers only, see probe)
+	# repo     : remote (fresh) | cached (offline, the last catalog) | bundled
+	#            (the copy that shipped with the image is the newest we have)
+	# available: false when there is no usable catalog for this architecture -
+	#            the Store then shows "Repository unavailable" and refuses to
+	#            start installs. "error" says why (a bad catalog, or the last
+	#            refresh that was thrown away).
+	ref=0; [ -f "$CACHE/refreshed" ] && ref="$(cat "$CACHE/refreshed")"
+	n=0; schema=""; updated=""; err=""; avail=false
+	if [ -z "$OS_ARCH" ]; then err=unknown-arch
+	elif ! have_catalog; then err=no-catalog
+	elif catalog_check "$CATALOG"; then
+		avail=true; n=$CK_APPS; schema=$CK_SCHEMA; updated=$CK_UPDATED
+	else err=$CK_WHY
+	fi
+	[ -n "$err" ] || { [ -r "$DIAG" ] && err="$(sed -n 's/^reason=//p' "$DIAG" | head -1)"; }
+	if have_net; then on=true; else on=false; fi
+	if [ "$CATALOG" = "$CATALOG_BUNDLED" ] && have_catalog; then repo=bundled
+	elif [ "$on" = true ]; then repo=remote; else repo=cached; fi
+	printf '{"online":%s,"repo":"%s","available":%s,"refreshed":%s,"apps":%s,"arch":"%s","bits":%s,"catalog":"%s","source":"%s","schema":"%s","updated":"%s","error":"%s"}\n' \
+		"$on" "$repo" "$avail" "${ref:-0}" "${n:-0}" "${OS_ARCH:-unknown}" "$OS_BITS" "$CATALOG_NAME" \
+		"$REPO_URL" "$schema" "$updated" "$err"
+}
+
+# Old index.tsv column numbers, mapped onto the JSON keys for the callers
+# that still use them.
+idx_field() { # id colnum-or-name -> value
+	case "$2" in
+		1)  echo "$1" ;;
+		2)  idx_get "$1" 2 ;;
+		3)  japp "$1" category ;;
+		4)  japp "$1" architecture ;;
+		5)  idx_get "$1" 3 ;;
+		6)  idx_get "$1" 4 ;;
+		7)  japp "$1" checksum ;;
+		8)  japp "$1" package_type ;;
+		9)  japp "$1" id ;;
+		10) japp "$1" download_url ;;
+		11) kind_of "$1" ;;
+		12) japp "$1" last_updated ;;
+		13) echo "" ;;
+		14) japp "$1" icon_url ;;
+		15) echo "" ;;
+		16) is_installable "$1" && echo 1 || echo 0 ;;
+		17) japp "$1" exec_path ;;
+		18) japp "$1" icon_path ;;
+		*)  japp "$1" "$2" ;;
+	esac
+}
+
+# catalog packaging -> the install mechanism xxri-app uses (default archive)
+kind_of() { # id -> appimage | archive | tcz
+	# URL first: some entries' package_type disagrees with their download_url
+	# (tinycore_tcz pointing at a .tar.bz2)
+	case "$(japp "$1" download_url)" in
+		*.AppImage|*.appimage)          echo appimage; return ;;
+		*.tcz)                          echo tcz;      return ;;
+		*.tar.gz|*.tgz|*.tar.xz|*.txz|*.tar.bz2|*.tbz|*.zip|*.7z) echo archive; return ;;
+		# nothing in xxri-app can run these
+		*.sh|*.run|*.deb|*.rpm|*.AppInstaller) echo installer; return ;;
+	esac
+	case "$(japp "$1" package_type)" in
+		official_appimage|community_appimage) echo appimage ;;
+		tinycore_tcz)                          echo tcz ;;
+		*)                                     echo archive ;;
+	esac
+}
+
+# entries without a usable download stay listed but not installable
+is_installable() { # id
+	u="$(japp "$1" download_url)"
+	[ -n "$u" ] && [ "$u" != null ] || return 1
+	case "$u" in http://*|https://*) ;; *) return 1 ;; esac
+	# a directory listing is not a package
+	case "$u" in */) return 1 ;; esac
+	case "$(kind_of "$1")" in appimage|archive|tcz) ;; *) return 1 ;; esac
+	return 0
+}
+cmd_field() { # id key
+	case "$2" in
+		name)     japp "$1" title ;;
+		category) japp "$1" category ;;
+		arch)     japp "$1" architecture ;;
+		version)  v="$(japp "$1" version)"; [ -n "$v" ] || v="$(japp "$1" current_upstream_version)"; echo "$v" ;;
+		url)      japp "$1" download_url ;;
+		kind)     kind_of "$1" ;;
+		icon)     japp "$1" icon_url ;;
+		installable) is_installable "$1" && echo 1 || echo 0 ;;
+		*)        japp "$1" "$2" ;;
+	esac
+}
+
+# media cache
+# lazy and cached; the GUI draws its own tile until an icon lands
+cmd_cache_path() { echo "$CACHE"; }
+icon_is_image() { # file
+	[ -s "$1" ] || return 1
+	m="$(hexdump -n 8 -e '8/1 "%02x"' "$1" 2>/dev/null)"
+	case "$m" in
+		89504e470d0a1a0a*) return 0 ;;   # PNG
+		ffd8ff*)           return 0 ;;   # JPEG
+		47494638*)         return 0 ;;   # GIF
+		424d*)             return 0 ;;   # BMP
+		00000100*)         return 0 ;;   # ICO
+	esac
+	head -c 400 "$1" 2>/dev/null | grep -qiE '<svg|<\?xml' && return 0
+	return 1
+}
+
+cmd_icons() { # id...
+	# re-fetched only when the catalog's icon_url changes (.src)
+	mkdir -p "$CACHE/icons"
+	# 4 at a time: one by one, the last cards missed the GUI's polling window
+	_pending=0
+	for id in "$@"; do
+		out="$CACHE/icons/$id.png"
+		u="$(japp "$id" icon_url)"
+		[ -n "$u" ] && [ "$u" != null ] || continue
+		src="$CACHE/icons/$id.src"
+		if [ -s "$out" ] && [ "$(cat "$src" 2>/dev/null)" = "$u" ]; then continue; fi
+		(
+			if fetch_to "$u" "$out.part" && [ -s "$out.part" ] && icon_is_image "$out.part"; then
+				mv "$out.part" "$out"; echo "$u" > "$src"
+			else
+				# never cache an error page as an icon
+				rm -f "$out.part"
+			fi
+		) &
+		_pending=$((_pending + 1))
+		[ "$_pending" -ge 4 ] && { wait; _pending=0; }
+	done
+	wait
+	echo ok
+}
+cmd_shots() { # id
+	mkdir -p "$CACHE/shots"
+	n=0
+	for u in $(idx_field "$1" 15 | tr ';' ' '); do
+		out="$CACHE/shots/$1-$n.png"; n=$((n+1))
+		[ -s "$out" ] && continue
+		fetch_to "$u" "$out.part" && [ -s "$out.part" ] \
+			&& mv "$out.part" "$out" || rm -f "$out.part"
+	done
+	echo ok
+}
+
+# refresh
+# Prints one word: fresh | unchanged | updated | offline-cached | rejected:<why> |
+# unavailable | invalid:<why>. Anything the download got wrong (no answer, an
+# HTML page, a truncated file, another architecture's catalog) is thrown away
+# and logged in $DIAG; the catalog that was there stays. Nothing is ever
+# replaced by, or substituted with, a catalog of another architecture.
+diag() { # reason [http-status-line]
+	{
+		echo "time=$(date +%s)"
+		echo "catalog=$CATALOG_NAME"
+		echo "arch=${OS_ARCH:-unknown}"
+		echo "url=$REPO_URL"
+		echo "reason=$1"
+		[ -n "$2" ] && echo "http=$2"
+	} > "$DIAG" 2>/dev/null
+}
+cmd_refresh() {
+	mkdir -p "$CACHE" 2>/dev/null
+	if [ -z "$OS_ARCH" ] || [ -z "$REPO_URL" ]; then
+		diag unknown-arch; echo "unavailable" >&2; return 1
+	fi
+	# Store start: once CACHE_MAX_AGE is up; the Refresh button forces it
+	if [ "$1" != "--force" ] && [ -f "$CACHE/refreshed" ]; then
+		age=$(( $(date +%s) - $(cat "$CACHE/refreshed" 2>/dev/null || echo 0) ))
+		if [ "$age" -lt "$CACHE_MAX_AGE" ] && [ -s "$CATALOG_CACHE" ]; then echo "fresh"; return 0; fi
+	fi
+
+	tmp="$CACHE/.${CATALOG_NAME%.json}.$$"
+	# conditional GET, only against the cached copy of this architecture
+	prev_tag="$(sed -n 's/^etag=//p' "$CATALOG_META" 2>/dev/null | head -1)"
+	prev_mod="$(sed -n 's/^last-modified=//p' "$CATALOG_META" 2>/dev/null | head -1)"
+	cond=""
+	if [ -s "$CATALOG_CACHE" ]; then
+		[ -n "$prev_tag" ] && cond="If-None-Match: $prev_tag"
+		[ -z "$cond" ] && [ -n "$prev_mod" ] && cond="If-Modified-Since: $prev_mod"
+	fi
+
+	hdr="$CACHE/.hdr.$$"
+	if [ -n "$GNUWGET" ]; then
+		"$GNUWGET" -q --timeout=45 --tries=2 ${CABUNDLE:+--ca-certificate="$CABUNDLE"} \
+			-U xxri-store ${cond:+--header="$cond"} -S -O "$tmp" "$REPO_URL" 2>"$hdr"
+		rc=$?
+	else
+		wget -q -T 45 -O "$tmp" "$REPO_URL" 2>"$hdr"; rc=$?
+	fi
+
+	if grep -qi '304 Not Modified' "$hdr" 2>/dev/null && [ -s "$CATALOG_CACHE" ]; then
+		rm -f "$tmp" "$hdr"; date +%s > "$CACHE/refreshed"; rm -f "$DIAG"
+		echo "unchanged"; return 0
+	fi
+
+	http="$(grep -i 'HTTP/' "$hdr" 2>/dev/null | tail -1 | sed 's/^ *//' | tr -d '\r')"
+	if [ "$rc" -ne 0 ] || [ ! -s "$tmp" ]; then
+		rm -f "$tmp" "$hdr"
+		diag "download-failed" "$http"
+		if have_catalog; then echo "offline-cached"; return 0; fi
+		echo "unavailable" >&2; return 1
+	fi
+
+	# never replace a good catalog with something that isn't one of ours
+	if ! catalog_check "$tmp"; then
+		why=$CK_WHY; rm -f "$tmp" "$hdr"; diag "$why" "$http"
+		if have_catalog; then echo "rejected:$why"; return 0; fi
+		echo "invalid:$why" >&2; return 1
+	fi
+
+	changed=yes
+	if [ -s "$CATALOG_CACHE" ] && cmp -s "$tmp" "$CATALOG_CACHE"; then changed=no; fi
+	mv -f "$tmp" "$CATALOG_CACHE"
+	{
+		et="$(sed -n 's/.*[Ee][Tt]ag:[ ]*//p' "$hdr" 2>/dev/null | tr -d '\r' | head -1)"
+		lm="$(sed -n 's/.*[Ll]ast-[Mm]odified:[ ]*//p' "$hdr" 2>/dev/null | tr -d '\r' | head -1)"
+		[ -n "$et" ] && echo "etag=$et"
+		[ -n "$lm" ] && echo "last-modified=$lm"
+	} > "$CATALOG_META" 2>/dev/null
+	rm -f "$hdr"
+	pick_catalog
+	date +%s > "$CACHE/refreshed"; rm -f "$DIAG"
+	[ "$changed" = yes ] && echo "updated" || echo "unchanged"
+	return 0
+}
+
+# resolve
+resolve() { # id -> URL \t SHA256 \t VERSION \t SIZE
+	# URL exactly as the catalog publishes it, never rewritten (repo contract)
+	id="$1"
+	url="$(japp "$id" download_url)"
+	[ "$url" = null ] && url=""
+	sha="$(japp "$id" checksum)"; [ "$sha" = null ] && sha=""
+	ver="$(japp "$id" version)"
+	[ -n "$ver" ] || ver="$(japp "$id" current_upstream_version)"
+	sz="$(japp "$id" size)"; case "$sz" in ''|*[!0-9]*) sz=0 ;; esac
+	printf '%s\t%s\t%s\t%s\n' "$url" "${sha:--}" "$ver" "$sz"
+}
+cmd_resolve() { resolve "$1"; }
+
+# Host libraries an AppImage needs (xxri-app deps-missing finds them): fetched
+# from $REMOTE_BASE/runtime/<arch>/index.tsv (soname, sha256, size, file) into
+# xxri-app's rt-lib-dir.
+RT_INDEX="$CACHE/runtime-index.tsv"
+rt_index_refresh() { # fetch the index when missing or older than 6 hours
+	[ -s "$RT_INDEX" ] && [ -z "$(find "$RT_INDEX" -mmin +360 2>/dev/null)" ] && return 0
+	if fetch_to "$REMOTE_BASE/runtime/$OS_ARCH/index.tsv" "$RT_INDEX.tmp" \
+	   && [ -s "$RT_INDEX.tmp" ] && ! grep -qi '<html' "$RT_INDEX.tmp"; then
+		mv "$RT_INDEX.tmp" "$RT_INDEX"; return 0
+	fi
+	rm -f "$RT_INDEX.tmp"
+	[ -s "$RT_INDEX" ]      # an old copy still answers
+}
+rt_fetch() { # soname -> 0 when it is now installed in the runtime-library directory
+	_rt_so="$1"
+	_rt_rl="$(awk -F'\t' -v s="$_rt_so" '$1 == s { print; exit }' "$RT_INDEX" 2>/dev/null)"
+	[ -n "$_rt_rl" ] || { trace deps "$_rt_so: not in the runtime index"; return 1; }
+	_rt_sha="$(echo "$_rt_rl" | cut -f2)"; _rt_file="$(echo "$_rt_rl" | cut -f4)"
+	[ -n "$_rt_file" ] || _rt_file="$_rt_so"
+	_rt_dir="$(xxri-app rt-lib-dir)"
+	mkdir -p "$_rt_dir" 2>/dev/null || return 1
+	_rt_tmp="$_rt_dir/.$_rt_so.part"
+	if ! fetch_to "$REMOTE_BASE/runtime/$OS_ARCH/$_rt_file" "$_rt_tmp"; then
+		rm -f "$_rt_tmp"; trace deps "$_rt_so: download failed"; return 2
+	fi
+	if [ -n "$_rt_sha" ] && [ "$_rt_sha" != "-" ] && have_sha256 \
+	   && [ "$(sha256_of "$_rt_tmp")" != "$_rt_sha" ]; then
+		rm -f "$_rt_tmp"; trace deps "$_rt_so: checksum mismatch"; return 2
+	fi
+	chmod 0644 "$_rt_tmp"; mv -f "$_rt_tmp" "$_rt_dir/$_rt_so"
+	trace deps "$_rt_so: installed"
+	return 0
+}
+# id file -> 0 when the app can start; 1 (ERROR set) when a program lacks a library we cannot supply
+deps_step() {
+	_dp_id="$1"; _dp_f="$2"; _dp_n=0; _dp_net=0
+	while [ "$_dp_n" -lt 4 ]; do
+		_dp_miss="$(xxri-app deps-missing "$_dp_f" 2>/dev/null)" || { trace deps "scan failed, not blocking the install"; return 0; }
+		[ -n "$_dp_miss" ] || break
+		trace deps "missing from the host: $(echo "$_dp_miss" | tr '\n' ' ')"
+		dl_set "$_dp_id" STATE dependencies
+		rt_index_refresh || { trace deps "no runtime index (offline, or not published)"; _dp_net=1; break; }
+		_dp_got=0
+		for _dp_so in $(echo "$_dp_miss" | sed 's/^[a-z]* //'); do
+			rt_fetch "$_dp_so"; _dp_rc=$?
+			[ "$_dp_rc" = 0 ] && _dp_got=$((_dp_got + 1))
+			[ "$_dp_rc" = 2 ] && _dp_net=1
+		done
+		[ "$_dp_got" -gt 0 ] || break
+		_dp_n=$((_dp_n + 1))
+	done
+	# a library a PROGRAM needs and we could not supply: it would not start
+	_dp_req="$(xxri-app deps-missing "$_dp_f" 2>/dev/null | sed -n 's/^req //p' | tr '\n' ' ' | sed 's/ $//; s/ /, /g')"
+	[ -z "$_dp_req" ] && return 0
+	if [ "$_dp_net" = 1 ]; then
+		dl_set "$_dp_id" ERROR "Could not download the system libraries this app needs ($_dp_req). Check your connection and retry."
+	else
+		dl_set "$_dp_id" ERROR "This app needs a system library XXRI OS Lite does not provide yet: $_dp_req"
+	fi
+	trace deps "FAIL: required but unavailable: $_dp_req"
+	return 1
+}
+
+# download manager
+dl_set() { # id key val
+	f="$DL_STATE/$1"; k="$2"; v="$3"
+	[ -f "$f" ] || : > "$f"
+	if grep -q "^$k=" "$f" 2>/dev/null; then
+		sed "s|^$k=.*|$k=$v|" "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+	else echo "$k=$v" >> "$f"; fi
+}
+dl_fail() { dl_set "$1" STATE failed; dl_set "$1" ERROR "$2"; }   # id message
+dl_get() { sed -n "s/^$2=//p" "$DL_STATE/$1" 2>/dev/null | head -1; }
+num() { case "$1" in ''|*[!0-9]*) echo 0 ;; *) echo "$1" ;; esac; }
+
+# Disk an install really uses, in KB: archives expand ~3x, and a .tcz pulls
+# its dependency chain (GIMP: 22 MB .tcz, ~80 MB of deps).
+space_needed() { # id -> KB
+	_sz="$(num "$(idx_field "$1" 6)")"
+	[ "$_sz" -gt 0 ] || _sz=$((32 * 1024 * 1024))     # unknown size: assume 32 MB
+	case "$(idx_field "$1" 11)" in
+		tcz)     _mult=5 ;;   # extension + its dependency closure
+		archive) _mult=4 ;;   # tarball + expanded tree
+		*)       _mult=2 ;;   # AppImage stays packed
+	esac
+	echo $(( (_sz / 1024) * _mult + 51200 ))          # + 50 MB working headroom
+}
+
+# install
+remote_size() { # url -> Content-Length of the final response (0 when unknown)
+	case "$1" in /*|file://*) echo 0; return;; esac
+	[ -n "$GNUWGET" ] || { echo 0; return; }
+	_n="$("$GNUWGET" -q --spider -S --timeout=15 --tries=1 ${CABUNDLE:+--ca-certificate="$CABUNDLE"} \
+		-U xxri-store "$1" 2>&1 | sed -n 's/^ *[Cc]ontent-[Ll]ength: *\([0-9]*\).*/\1/p' | tail -n 1)"
+	num "$_n"
+}
+fetch_loop() { # id url out total  - download (resumable) + progress keys
+	id="$1"; url="$2"; out="$3"; total="$(num "$4")"
+	case "$url" in
+		/*|file://*)
+			src="${url#file://}"
+			( cp "$src" "$out.part" 2>/dev/null && mv "$out.part" "$out" ) & ;;
+		*)
+			( fetch_to "$url" "$out.part" -c && mv "$out.part" "$out" ) & ;;
+	esac
+	wp=$!; echo "$wp" > "$DL_STATE/$id.pid"
+	# the catalog may not know the size: ask the server, or the bar has no scale
+	[ "$total" -gt 0 ] || total="$(remote_size "$url")"
+	dl_set "$id" TOTAL "$total"
+	prev=$(num "$(dl_get "$id" BYTES)")
+	while kill -0 "$wp" 2>/dev/null; do
+		b=$(num "$(wc -c 2>/dev/null < "$out.part")")
+		[ -f "$out" ] && b=$(num "$(wc -c 2>/dev/null < "$out")")
+		dl_set "$id" BYTES "$b"
+		sp=$(( b - prev )); [ "$sp" -lt 0 ] && sp=0; prev=$b
+		dl_set "$id" SPEED "$sp"
+		# scale down before multiplying: b*100 overflows 32-bit signed
+		# arithmetic past ~21 MB, which collapsed the bar for every real app
+		[ "$total" -gt 0 ] && dl_set "$id" PCT $(( (b / 1024) * 100 / (total / 1024 + 1) ))
+		sleep 1
+	done
+	wait "$wp"; rc=$?; rm -f "$DL_STATE/$id.pid"
+	# paused by cmd_pause? leave the .part alone and report "paused"
+	[ "$(dl_get "$id" STATE)" = paused ] && return 3
+	dl_set "$id" SPEED 0
+	[ $rc -eq 0 ] && [ -s "$out" ] && return 0
+	return 1
+}
+
+is_html_page() { # file -> 0 when a download is plainly an HTML page
+	# a catalog link can answer fine and still be a directory listing or a
+	# download page. Only a file that opens like HTML counts, so extensionless
+	# binaries still get through
+	head -c 1024 "$1" 2>/dev/null | tr 'A-Z' 'a-z' |
+		grep -qE '<!doctype[[:space:]]+html|<html[[:space:]>]'
+}
+
+cmd_install() { # id  (also used by resume/retry/update)
+	id="$1"
+	TRACE_ID="$id"
+	trace install-clicked "backend entered"
+	# a cached catalog still browses offline, installs can't
+	if ! have_net; then
+		dl_set "$id" NAME "$id"; dl_fail "$id" "Repository unavailable - you are offline"
+		trace offline "FAIL: no network; installation refused"
+		echo "ERR:offline"; return 2
+	fi
+	name="$(idx_field "$id" 2)"; [ -n "$name" ] || name="$(dl_get "$id" NAME)"; [ -n "$name" ] || name="$id"
+	dl_set "$id" NAME "$name"
+	if ! idx_has "$id"; then
+		dl_fail "$id" "This app is not in the active repository"
+		trace catalog-lookup "FAIL: id not in the repository catalog ($REPO_URL)"
+		echo "ERR:nocatalog"; return 2
+	fi
+	kind="$(idx_field "$id" 11)"
+	trace catalog-lookup "ok name='$name' kind=$kind src=$(idx_field "$id" 8)"
+	if [ -z "$OS_ARCH" ]; then   # no guess: a wrong one installs the wrong binary
+		dl_fail "$id" "Cannot tell which architecture this system is"
+		trace arch-check "FAIL: unknown architecture"
+		echo "ERR:arch:unknown"; return 2
+	fi
+	archlist="$(idx_field "$id" 4)"; me="$(this_arch)"
+	case " $archlist " in
+		*" $me "*|*" any "*|"  ") trace arch-check "ok [$archlist] on $me" ;;
+		*) dl_fail "$id" "Requires $archlist - this device is $me"
+		   trace arch-check "FAIL: needs [$archlist], device is $me"
+		   echo "ERR:arch:$archlist"; return 2 ;;
+	esac
+	dl_set "$id" ERROR ""; dl_set "$id" PCT 0; dl_set "$id" SPEED 0
+
+	# space check up front, or tce-load/tar fail later with nothing useful
+	need_kb="$(space_needed "$id")"
+	free_kb="$(df -k / 2>/dev/null | awk 'NR==2{print $4}')"
+	free_kb="$(num "$free_kb")"
+	if [ "$free_kb" -gt 0 ] && [ "$need_kb" -gt "$free_kb" ]; then
+		dl_fail "$id" "Not enough disk space: $name needs about $((need_kb/1024)) MB, only $((free_kb/1024)) MB free"
+		trace disk-space "FAIL: need ${need_kb}KB, free ${free_kb}KB"
+		echo "ERR:space:$((need_kb/1024)):$((free_kb/1024))"; return 2
+	fi
+	trace disk-space "ok need ${need_kb}KB, free ${free_kb}KB"
+
+	# one install at a time: queue behind the current one
+	dl_set "$id" STATE queued
+	trace queued "entry created in $DL_STATE/$id"
+	waited=0
+	while ! mkdir "$LOCK" 2>/dev/null; do
+		lp="$(cat "$LOCK/pid" 2>/dev/null)"
+		if [ -z "$lp" ] || ! kill -0 "$lp" 2>/dev/null; then
+			trace lock "stale lock from pid '${lp:-none}' cleared"
+			rm -rf "$LOCK"; continue
+		fi
+		[ "$waited" = 0 ] && trace lock "waiting: pid $lp holds the install lock"
+		sleep 2; waited=$((waited+2))
+		[ "$waited" -ge 600 ] && { dl_fail "$id" "Queue timeout"
+			trace lock "FAIL: 600s queue timeout behind pid $lp"; echo "ERR:queue"; return 1; }
+	done
+	echo $$ > "$LOCK/pid"
+	trap 'rm -rf "$LOCK"' EXIT INT TERM
+	trace lock "acquired after ${waited}s"
+
+	dl_set "$id" STATE resolving; echo $$ > "$DL_STATE/$id.pid"
+	# resume path: reuse the URL we resolved before pausing
+	url="$(dl_get "$id" URL)"; sha="$(dl_get "$id" SHA)"; ver="$(dl_get "$id" VER)"; tot="$(num "$(dl_get "$id" TOTAL)")"
+	if [ -z "$url" ] || [ ! -f "$(dl_get "$id" FILE).part" ]; then
+		res="$(resolve "$id")"
+		url="$(echo "$res" | cut -f1)"; sha="$(echo "$res" | cut -f2)"
+		ver="$(echo "$res" | cut -f3)"; tot="$(num "$(echo "$res" | cut -f4)")"
+	fi
+	if [ -z "$url" ]; then
+		if have_net; then dl_fail "$id" "No downloadable release found for this app"
+		else dl_fail "$id" "You are offline - this app needs an internet connection"; fi
+		trace provider "FAIL: resolved no URL (src_type=$(idx_field "$id" 8))"
+		echo "ERR:nourl"; return 1
+	fi
+	trace provider "ok ver=${ver:-?} size=${tot:-0} url=$url"
+	dl_set "$id" URL "$url"; dl_set "$id" SHA "$sha"; dl_set "$id" VER "$ver"
+
+	fn="$(echo "$name" | tr 'A-Z ' 'a-z-' | sed 's/[^a-z0-9._-]//g')"; [ -n "$fn" ] || fn="$id"
+	# archives keep a neutral name; only AppImages get the .AppImage suffix
+	case "$kind" in
+		archive) out="$DL_DIR/$fn-${ver:-latest}.pkg" ;;
+		tcz)     out="$DL_DIR/$(basename "$url")" ;;
+		*)       out="$DL_DIR/$fn-${ver:-latest}.AppImage" ;;
+	esac
+	# tce-load does the transfer; watch the extension store grow for progress
+	# (otherwise the row sits at "Installing" for minutes)
+	if [ "$kind" = tcz ]; then
+		nm="$(idx_field "$id" 2)"; ex="$(idx_field "$id" 17)"
+		ref="$(idx_field "$id" 9)"; [ -n "$ref" ] || ref="$id"
+		trace backend-call "xxri-app install-tcz $ref (tce-load owns the transfer)"
+		dl_set "$id" STATE downloading; dl_set "$id" FILE "$TCE_OPT/$ref.tcz"
+		est=$(( tot * 4 )); [ "$est" -gt 0 ] || est=$((64 * 1024 * 1024))
+		base="$(num "$(du -sk "$TCE_OPT" 2>/dev/null | awk '{print $1}')")"
+		install_log="$CACHE/install-$id.log"
+		XXRI_APP_VERSION="$ver" xxri-app install-tcz "$ref" --quiet --as "$id" \
+		     --name "$nm" ${ex:+--exec "$ex"} >"$install_log" 2>&1 &
+		wp=$!; echo "$wp" > "$DL_STATE/$id.pid"
+		prev=0
+		while kill -0 "$wp" 2>/dev/null; do
+			cur="$(num "$(du -sk "$TCE_OPT" 2>/dev/null | awk '{print $1}')")"
+			got=$(( (cur - base) * 1024 )); [ "$got" -lt 0 ] && got=0
+			dl_set "$id" BYTES "$got"
+			sp=$(( got - prev )); [ "$sp" -lt 0 ] && sp=0; prev="$got"
+			dl_set "$id" SPEED "$sp"
+			# scale down BEFORE multiplying: got*100 overflows 32-bit signed
+			# arithmetic past ~21 MB and the percentage collapses to zero
+			pc=$(( (got / 1024) * 100 / (est / 1024 + 1) ))
+			[ "$pc" -gt 99 ] && pc=99; [ "$pc" -lt 0 ] && pc=0
+			dl_set "$id" PCT "$pc"
+			sleep 1
+		done
+		wait "$wp"; irc=$?
+		if [ "$irc" -eq 0 ]; then
+			rm -f "$DL_STATE/$id.pid"
+			dl_set "$id" SPEED 0; dl_set "$id" PCT 100
+			dl_set "$id" STATE completed
+			trace done "completed"
+			echo "OK:$id"; return 0
+		fi
+		rm -f "$DL_STATE/$id.pid"
+		detail="$(tail -n 1 "$install_log" 2>/dev/null | tr '\r\n' ' ')"
+		trace backend-call "FAIL: xxri-app install-tcz rc=$irc${detail:+: $detail}"
+		dl_set "$id" SPEED 0
+		if have_net; then dl_fail "$id" "$name could not be installed (details saved in install-$id.log)"
+		else dl_fail "$id" "You are offline - this app needs an internet connection"; fi
+		echo "ERR:install"; return 1
+	fi
+
+	dl_set "$id" STATE downloading; dl_set "$id" FILE "$out"
+
+	trace download-start "-> $out"
+	fetch_loop "$id" "$url" "$out" "$tot"; frc=$?
+	[ $frc -eq 3 ] && { trace download-paused "user paused"; echo "PAUSED"; return 0; }
+	if [ $frc -ne 0 ]; then
+		dl_fail "$id" "Download failed - check your connection and retry"
+		trace download-start "FAIL: fetch_loop rc=$frc"
+		echo "ERR:download"; return 1
+	fi
+	b=$(num "$(wc -c 2>/dev/null < "$out")")
+	trace download-done "$b bytes"
+	dl_set "$id" BYTES "$b"; dl_set "$id" PCT 100
+	if [ "$kind" = archive ] && is_html_page "$out"; then
+		dl_fail "$id" "The catalog link returned a web page, not an installable package"
+		trace validate "FAIL: download is HTML, not an archive (catalog URL needs updating)"
+		rm -f "$out"
+		echo "ERR:metadata"; return 1
+	fi
+
+	# no digest tool (stripped build): skip rather than block installs
+	if [ -n "$sha" ] && [ "$sha" != "-" ] && have_sha256; then
+		dl_set "$id" STATE verifying
+		got="$(sha256_of "$out")"
+		if [ -n "$got" ] && [ "$got" != "$sha" ]; then
+			dl_fail "$id" "Checksum mismatch - the download was corrupted"
+			trace verify "FAIL: sha256 mismatch"
+			rm -f "$out"; echo "ERR:sha256"; return 1
+		fi
+		trace verify "ok sha256 matches"
+	else
+		trace verify "skipped (catalog pins no digest)"
+	fi
+
+	# AppImage: install the host libraries it needs first ("Installing required dependencies")
+	if [ "$kind" != archive ]; then
+		echo $$ > "$DL_STATE/$id.pid"
+		if ! deps_step "$id" "$out"; then
+			rm -f "$DL_STATE/$id.pid" "$out"
+			dl_set "$id" STATE failed
+			echo "ERR:dependencies"; return 1
+		fi
+	fi
+
+	# xxri-app does the install; --as the catalog id so updates replace it
+	dl_set "$id" STATE installing; echo $$ > "$DL_STATE/$id.pid"
+	chmod +x "$out" 2>/dev/null
+	if [ "$kind" = archive ]; then
+		# portable build (tar.xz / tar.gz / zip)
+		nm="$(idx_field "$id" 2)"; ex="$(idx_field "$id" 17)"; ic="$(idx_field "$id" 18)"
+		trace backend-call "xxri-app install-archive $out"
+		install_log="$CACHE/install-$id.log"
+		if XXRI_APP_VERSION="$ver" xxri-app install-archive "$out" --quiet --as "$id" \
+		     --name "$nm" ${ex:+--exec "$ex"} ${ic:+--icon "$ic"} >"$install_log" 2>&1; then
+			rm -f "$DL_STATE/$id.pid" "$out"
+			dl_set "$id" STATE completed
+			trace done "completed"
+			echo "OK:$id"; return 0
+		fi
+		rm -f "$DL_STATE/$id.pid"
+		detail="$(tail -n 1 "$install_log" 2>/dev/null | tr '\r\n' ' ')"
+		trace backend-call "FAIL: xxri-app install-archive returned non-zero${detail:+: $detail}"
+		dl_fail "$id" "The package could not be installed (details saved in install-$id.log)"
+		echo "ERR:install"; return 1
+	fi
+	trace backend-call "xxri-app integrate $out"
+	install_log="$CACHE/install-$id.log"
+	if xxri-app integrate "$out" --quiet --as "$id" >"$install_log" 2>&1; then
+		rm -f "$DL_STATE/$id.pid"
+		trace done "completed"
+		dl_set "$id" STATE completed; echo "OK:$out"; return 0
+	fi
+	rm -f "$DL_STATE/$id.pid"
+	detail="$(grep -v '^$' "$install_log" 2>/dev/null | tail -n 1 | tr '\r\n' ' ')"
+	trace backend-call "FAIL: xxri-app integrate returned non-zero${detail:+: $detail}"
+	dl_fail "$id" "The package could not be integrated (details saved in install-$id.log)"
+	echo "ERR:integrate"; return 1
+}
+cmd_retry() { dl_set "$1" URL ""; cmd_install "$1"; }
+cmd_resume() { cmd_install "$1"; }
+
+# download manager
+# The Downloads page's queue, one flat JSON object per entry. Every key the
+# GUI reads must be there even when 0, or the row renders blank.
+json_esc() { sed 's/\\/\\\\/g; s/"/\\"/g' ; }
+
+cmd_downloads() {
+	printf '{"downloads":['
+	first=1
+	for f in "$DL_STATE"/*; do
+		[ -f "$f" ] || continue
+		case "$f" in *.pid) continue ;; esac
+		id="${f##*/}"
+		st="$(dl_get "$id" STATE)"; [ -n "$st" ] || continue
+		nm="$(dl_get "$id" NAME)"; [ -n "$nm" ] || nm="$id"
+		by="$(num "$(dl_get "$id" BYTES)")"; tot="$(num "$(dl_get "$id" TOTAL)")"
+		sp="$(num "$(dl_get "$id" SPEED)")"; pct="$(num "$(dl_get "$id" PCT)")"
+		err="$(dl_get "$id" ERROR)"
+		# seconds remaining, from the last observed rate
+		eta=0
+		[ "$sp" -gt 0 ] && [ "$tot" -gt "$by" ] && eta=$(( (tot - by) / sp ))
+		[ "$first" = 1 ] || printf ','
+		first=0
+		printf '{"id":"%s","name":"%s","state":"%s","pct":%s,"bytes":%s,"total":%s,"speed":%s,"eta":%s,"error":"%s","file":"%s","url":"%s","version":"%s"}' \
+			"$id" "$(printf '%s' "$nm" | json_esc)" "$st" "$pct" "$by" "$tot" "$sp" "$eta" \
+			"$(printf '%s' "$err" | json_esc)" \
+			"$(printf '%s' "$(dl_get "$id" FILE)" | json_esc)" \
+			"$(printf '%s' "$(dl_get "$id" URL)" | json_esc)" \
+			"$(printf '%s' "$(dl_get "$id" VER)" | json_esc)"
+	done
+	printf ']}\n'
+}
+
+# keeps the .part for wget -c
+cmd_pause() { # id
+	p="$(cat "$DL_STATE/$1.pid" 2>/dev/null)"
+	[ -n "$p" ] && kill "$p" 2>/dev/null
+	dl_set "$1" STATE paused; dl_set "$1" SPEED 0
+	trace pause "download paused by the user"
+	echo "PAUSED"
+}
+
+# leaves nothing half-written behind
+cmd_cancel() { # id
+	p="$(cat "$DL_STATE/$1.pid" 2>/dev/null)"
+	[ -n "$p" ] && kill "$p" 2>/dev/null
+	out="$(dl_get "$1" FILE)"
+	[ -n "$out" ] && rm -f "$out" "$out.part" 2>/dev/null
+	rm -f "$DL_STATE/$1" "$DL_STATE/$1.pid" 2>/dev/null
+	trace cancel "download cancelled, partial file removed"
+	echo "CANCELLED"
+}
+
+cmd_clear() { # [id]
+	if [ -n "$1" ]; then rm -f "$DL_STATE/$1" "$DL_STATE/$1.pid" 2>/dev/null; echo "CLEARED"; return; fi
+	for f in "$DL_STATE"/*; do
+		[ -f "$f" ] || continue
+		case "$f" in *.pid) continue ;; esac
+		case "$(dl_get "${f##*/}" STATE)" in
+			completed|failed|cancelled) rm -f "$f" "$f.pid" 2>/dev/null ;;
+		esac
+	done
+	echo "CLEARED"
+}
+
+# installed / updates
+idx_has() { _f="$(idx_file)" || return 1; awk -F'\t' -v id="$1" 'NR > 1 && $1 == id { f = 1; exit } END { exit !f }' "$_f"; }
+catalog_id_for() { # registry-id name -> catalog id (id match first, then title)
+	_f="$(idx_file)" || return 0
+	awk -F'\t' -v id="$1" -v nm="$2" 'BEGIN { nm = tolower(nm) }
+		NR == 1 { next }
+		$1 == id { print $1; found = 1; exit }
+		tolower($2) == nm && t == "" { t = $1 }
+		END { if (!found && t != "") print t }' "$_f"
+}
+cmd_installed() { # xxri-app registry joined with catalog metadata (flat JSON)
+	printf '{"apps":['
+	first=1
+	xxri-app list 2>/dev/null | while IFS='|' read -r aid nm vr fl ll; do
+		[ -n "$aid" ] || continue
+		inst="$(xxri-app info "$aid" 2>/dev/null | sed -n 's/^INSTALLED=//p')"
+		loc="${fl%/*}"
+		cid="$(catalog_id_for "$aid" "$nm")"
+		[ "$first" = 1 ] || printf ','; first=0
+		printf '{"id":"%s","catalog_id":"%s","name":"%s","version":"%s","file":"%s","location":"%s","installed":"%s","last_launch":"%s"}' \
+			"$aid" "$cid" "$nm" "$vr" "$fl" "$loc" "$inst" "$ll"
+	done
+	printf ']}\n'
+}
+cmd_updates() {
+	printf '{"updates":['
+	first=1
+	xxri-app list 2>/dev/null | while IFS='|' read -r aid nm vr fl ll; do
+		[ -n "$nm" ] || continue
+		cid="$(catalog_id_for "$aid" "$nm")"
+		[ -n "$cid" ] || continue
+		latest="$(idx_field "$cid" 5)"
+		[ -n "$latest" ] && [ "$latest" != "latest" ] && [ "$latest" != "$vr" ] || continue
+		sz="$(num "$(idx_field "$cid" 6)")"
+		[ "$first" = 1 ] || printf ','; first=0
+		printf '{"id":"%s","catalog_id":"%s","name":"%s","current":"%s","latest":"%s","size":%s}' \
+			"$aid" "$cid" "$nm" "$vr" "$latest" "$sz"
+	done
+	printf ']}\n'
+}
+cmd_update_all() {
+	rc=0
+	xxri-store updates | tr '{' '\n' | sed -n 's/.*"catalog_id":"\([^"]*\)".*/\1/p' | while read -r cid; do
+		[ -n "$cid" ] && xxri-store install "$cid" || rc=1
+	done
+	return $rc
+}
+cmd_open_location() { # installed app id -> open its folder
+	loc="$(xxri-app info "$1" 2>/dev/null | sed -n 's/^LOCATION=//p')"
+	[ -n "$loc" ] || loc="$DL_DIR"
+	# flfm if present, else a terminal (XXRI File isn't tried here)
+	if command -v flfm >/dev/null 2>&1; then flfm "$loc" >/dev/null 2>&1 &
+	else aterm +sb -T "Files - $loc" -e /bin/sh -c "cd '$loc' && ls -la; exec /bin/sh" >/dev/null 2>&1 &
+	fi
+	echo "$loc"
+}
+
+case "$1" in
+	arch)       cmd_arch ;;
+	catalog-path) cmd_catalog_path ;;
+	status)     cmd_status ;;
+	online)     have_net ;;
+	repo-path)  repo_path ;;
+	refresh)    shift; cmd_refresh "$1" ;;
+	resolve)    shift; cmd_resolve "$1" ;;
+	install)    shift; cmd_install "$1" ;;
+	pause)      shift; cmd_pause "$1" ;;
+	resume)     shift; cmd_resume "$1" ;;
+	retry)      shift; cmd_retry "$1" ;;
+	cancel)     shift; cmd_cancel "$1" ;;
+	clear)      shift; cmd_clear "$1" ;;
+	downloads)  cmd_downloads ;;
+	installed)  cmd_installed ;;
+	updates)    cmd_updates ;;
+	update-all) cmd_update_all ;;
+	open-location) shift; cmd_open_location "$1" ;;
+	cache-path) cmd_cache_path ;;
+	icons)      shift; cmd_icons "$@" ;;
+	shots)      shift; cmd_shots "$1" ;;
+	field)      shift; cmd_field "$1" "$2" ;;
+	"")
+		# bare `xxri-store` opens the Store
+		if [ -n "$DISPLAY" ] && [ -x /usr/local/bin/xxri-store-gui ]; then
+			exec /usr/local/bin/xxri-store-gui
+		fi
+		echo "usage: xxri-store arch|catalog-path|status|online|repo-path|refresh|resolve|install|pause|resume|retry|cancel|clear|downloads|installed|updates|update-all|open-location|cache-path|icons|shots|field" >&2
+		exit 1 ;;
+	*) echo "usage: xxri-store arch|catalog-path|status|online|repo-path|refresh|resolve|install|pause|resume|retry|cancel|clear|downloads|installed|updates|update-all|open-location|cache-path|icons|shots|field" >&2; exit 1 ;;
+esac

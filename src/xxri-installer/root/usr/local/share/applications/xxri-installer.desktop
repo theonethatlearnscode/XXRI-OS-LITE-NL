@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Install XXRI OS Lite
+Comment=Install XXRI OS Lite to a disk
+Exec=xxri-installer
+Type=Application
+X-FullPathIcon=/usr/local/share/pixmaps/xxri-installer.png
+Icon=xxri-installer
+Categories=System;
